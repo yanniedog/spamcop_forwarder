@@ -74,8 +74,28 @@ class TeeOutput:
     
     def write(self, message):
         """Writes to both terminal and logfile"""
-        self.terminal.write(message)
-        self.terminal.flush()
+        # Write to terminal with encoding error handling
+        try:
+            self.terminal.write(message)
+            self.terminal.flush()
+        except (UnicodeEncodeError, AttributeError):
+            # If terminal can't handle Unicode, encode with error handling
+            try:
+                # Get terminal encoding or default to utf-8
+                encoding = getattr(self.terminal, 'encoding', None) or 'utf-8'
+                safe_message = message.encode(encoding, errors='replace').decode(encoding, errors='replace')
+                self.terminal.write(safe_message)
+                self.terminal.flush()
+            except Exception:
+                # If all else fails, try ASCII replacement
+                try:
+                    safe_message = message.encode('ascii', errors='replace').decode('ascii')
+                    self.terminal.write(safe_message)
+                    self.terminal.flush()
+                except Exception:
+                    pass  # Give up on terminal output
+        
+        # Write to logfile (already has error handling)
         if self.logfile:
             try:
                 # Strip ANSI codes before writing to log file
@@ -106,6 +126,7 @@ class TeeOutput:
 def is_initial_run_internal():
     """Determines if this is the initial run by checking logfile and download history
     Returns True if this appears to be the first run, False otherwise
+    Uses STRICT criteria - only returns False if there's STRONG evidence of completed runs
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     log_path = os.path.join(script_dir, LOG_FILE)
@@ -121,34 +142,39 @@ def is_initial_run_internal():
     except Exception:
         pass
     
-    # Check logfile content for evidence of successful previous runs
+    # Check logfile content for STRONG evidence of successful previous runs
+    # We are VERY conservative - only skip deletion if there's CLEAR evidence of multiple COMPLETED runs
+    # Default behavior: DELETE the logfile (treat as initial run) to start fresh
     try:
         with open(log_path, 'r', encoding='utf-8') as f:
             content = f.read()
             
-            # Look for evidence of successful completion:
-            # - "Initial setup completed" or similar success markers
-            # - Multiple "ITERATION #" entries (more than just the current one)
-            # - "Successfully selected SPAM/JUNK mailbox" (indicates successful folder selection)
-            # - "RUN ENDED" markers (indicates completed runs)
+            # Only return False (don't delete) if we have VERY CLEAR evidence of MANY successful runs WITH actual spam processing
+            # Default behavior: DELETE the logfile to start fresh (treat as initial run)
+            # Only keep logfile if there's overwhelming evidence of many successful runs that actually processed spam
             
-            has_successful_setup = (
-                'Successfully selected SPAM/JUNK mailbox' in content or
-                'Initial setup completed' in content.lower() or
-                'ITERATION #2' in content  # At least 2 iterations means first one completed
+            run_ended_count = content.count('RUN ENDED:')
+            
+            # Check for evidence of ACTUAL spam processing (not just folder checking)
+            has_actual_processing = (
+                ('DOWNLOAD STATISTICS' in content and 'Total Emails:' in content and 'Total Emails:      0' not in content) or
+                ('SUCCESS: Report sent to SpamCop' in content) or
+                ('Would send email:' in content and 'SIMULATION MODE' in content and 'Total Emails:' in content)
             )
             
-            has_completed_runs = content.count('RUN ENDED:') > 0
-            
-            # If we have evidence of successful setup or completed runs, it's not the first run
-            if has_successful_setup or has_completed_runs:
+            # Require BOTH:
+            # 1. At least 10 completed runs (many successful sessions)
+            # 2. Evidence of actual spam processing (not just folder checking)
+            # This ensures we only keep logfiles from well-established runs that actually processed spam
+            # For most cases, we'll delete and start fresh
+            if run_ended_count >= 10 and has_actual_processing:
                 return False
                 
     except Exception:
-        # If we can't read the logfile, assume it's not the first run to be safe
-        return False
+        # If we can't read the logfile, treat as first run (safer to delete and start fresh)
+        return True
     
-    # If logfile exists but has no evidence of successful runs, check download directory
+    # If logfile exists but has weak/no evidence of successful runs, check download directory
     # Note: BASE_DIRECTORY might not be defined yet when this is called early
     try:
         # Try to access BASE_DIRECTORY from the module's globals
@@ -166,7 +192,7 @@ def is_initial_run_internal():
         # BASE_DIRECTORY not defined yet or other error - skip this check
         pass
     
-    # Default: if logfile exists but is small/empty and no downloads, treat as first run
+    # Default: if logfile exists but has weak evidence, treat as first run (delete and start fresh)
     return True
 
 def setup_logging():
@@ -177,12 +203,16 @@ def setup_logging():
     # Determine if this is the initial run using internal checks
     is_initial_run = is_initial_run_internal()
     
-    # Delete logfile on initial run
-    if is_initial_run and os.path.exists(log_path):
-        try:
-            os.remove(log_path)
-        except Exception as e:
-            print(f"Warning: Could not delete logfile '{log_path}': {e}", file=sys.stderr)
+    # Wipe logfile contents on initial run (truncate to empty)
+    # This works even if the file is open/locked by another process
+    if is_initial_run:
+        if os.path.exists(log_path):
+            try:
+                # Truncate the file to empty - this works even if file is open
+                with open(log_path, 'w', encoding='utf-8') as f:
+                    f.write('')  # Wipe contents - effectively a fresh start
+            except Exception as e:
+                print(f"Warning: Could not wipe logfile '{log_path}': {e}", file=sys.stderr)
     
     # Replace stdout with TeeOutput (always append mode, since we deleted on initial run)
     tee = TeeOutput(LOG_FILE, overwrite=False)
@@ -683,140 +713,199 @@ def get_message_count(mail, folder_name):
 def get_most_recent_email_info(mail, folder_name):
     """Gets the date/time and subject of the most recent email in a folder
     Returns: (date_datetime, subject_string) or (None, None) if not found
+    Uses UID-based methods which are more reliable for folders with special characters
     """
-    try:
-        # Method 1: Use message number directly (most reliable for Gmail)
-        # Get message count first, then use the highest message number
+    # Try multiple methods to examine/select the folder
+    # Folder names with special characters need different handling
+    folder_selected = False
+    selected_data = None
+    last_error = None
+    
+    # Try different ways to select/examine the folder
+    select_methods = [
+        lambda: mail.examine(folder_name),
+        lambda: mail.examine(f'"{folder_name}"'),
+        lambda: mail.select(folder_name, readonly=True),
+        lambda: mail.select(f'"{folder_name}"', readonly=True),
+    ]
+    
+    for select_method in select_methods:
         try:
-            # Get message count using STATUS (doesn't require selecting folder)
-            status, message_count = mail.status(folder_name, "(MESSAGES)")
-            if status == 'OK' and message_count:
-                count_match = re.search(r'MESSAGES\s+(\d+)', str(message_count[0]))
+            status, data = select_method()
+            if status == 'OK':
+                folder_selected = True
+                selected_data = data
+                break
+        except Exception as e:
+            last_error = e
+            continue
+    
+    if not folder_selected:
+        # Could not select folder - return None
+        # Only log if it's a real error (not just trying different methods)
+        if last_error and 'examine' not in str(last_error).lower():
+            print(f"    Debug: Could not select folder '{folder_name}': {last_error}")
+        return None, None
+    
+    try:
+        # Get message count from SELECT/EXAMINE response
+        msg_count = 0
+        if selected_data:
+            for item in selected_data:
+                if isinstance(item, bytes):
+                    item_str = item.decode('utf-8', errors='ignore')
+                else:
+                    item_str = str(item)
+                count_match = re.search(r'(\d+)\s+EXISTS', item_str, re.IGNORECASE)
                 if count_match:
                     msg_count = int(count_match.group(1))
-                    if msg_count > 0:
-                        # Try multiple methods to select the folder
-                        status = None
-                        data = None
-                        select_methods = [
-                            lambda: mail.select(folder_name, readonly=True),
-                            lambda: mail.select(f'"{folder_name}"', readonly=True),
-                            lambda: mail.examine(folder_name),
-                            lambda: mail.examine(f'"{folder_name}"'),
-                        ]
-                        
-                        for select_method in select_methods:
-                            try:
-                                test_status, test_data = select_method()
-                                if test_status == 'OK':
-                                    status = test_status
-                                    data = test_data
-                                    break
-                            except Exception:
-                                continue
-                        
-                        if status == 'OK':
-                            # Verify we can actually fetch from this folder by trying a simple fetch
-                            # Some folders can be selected but can't be fetched from
-                            try:
-                                # Try to fetch just the message number to verify it's accessible
-                                test_fetch, test_data = mail.fetch(str(msg_count), '(UID)')
-                                if test_fetch != 'OK':
-                                    # Folder selected but can't fetch - might be a virtual folder
+                    break
+        
+        if msg_count == 0:
+            # No messages in folder
+            try:
+                mail.close()
+            except Exception:
+                pass
+            return None, None
+        
+        # Method 1: Use UID SEARCH (most reliable, especially for folders with special characters)
+        try:
+            # Search for all UIDs
+            status, uids = mail.uid('SEARCH', None, 'ALL')
+            if status != 'OK':
+                print(f"    Debug: UID SEARCH failed for '{folder_name}': status={status}")
+                try:
+                    mail.close()
+                except Exception:
+                    pass
+                return None, None
+                
+            if not uids or not uids[0]:
+                # Empty folder (shouldn't happen since msg_count > 0, but handle it)
+                try:
+                    mail.close()
+                except Exception:
+                    pass
+                return None, None
+                
+            uid_bytes = uids[0]
+            if isinstance(uid_bytes, bytes):
+                uid_str = uid_bytes.decode('utf-8', errors='ignore')
+            else:
+                uid_str = str(uid_bytes)
+            
+            # Parse UIDs
+            uid_list = [uid.strip() for uid in uid_str.split() if uid.strip()]
+            if not uid_list:
+                print(f"    Debug: No UIDs found for '{folder_name}' despite {msg_count} messages")
+                try:
+                    mail.close()
+                except Exception:
+                    pass
+                return None, None
+                
+            # Get the highest UID (most recent)
+            try:
+                # Filter to only numeric UIDs and find max
+                numeric_uids = [uid for uid in uid_list if uid.isdigit()]
+                if not numeric_uids:
+                    print(f"    Debug: No numeric UIDs found for '{folder_name}' (UIDs: {uid_list[:5]}...)")
+                    try:
+                        mail.close()
+                    except Exception:
+                        pass
+                    return None, None
+                    
+                highest_uid = max(numeric_uids, key=lambda x: int(x))
+                
+                # Fetch INTERNALDATE first (more reliable than header Date)
+                date_str = None
+                try:
+                    res_date, data_date = mail.uid('FETCH', highest_uid, '(INTERNALDATE)')
+                    if res_date != 'OK':
+                        print(f"    Debug: UID FETCH INTERNALDATE failed for '{folder_name}' UID {highest_uid}: status={res_date}")
+                    elif not data_date:
+                        print(f"    Debug: UID FETCH INTERNALDATE returned no data for '{folder_name}' UID {highest_uid}")
+                    else:
+                        date_str = parse_internal_date(data_date)
+                        if not date_str:
+                            print(f"    Debug: Could not parse INTERNALDATE for '{folder_name}' UID {highest_uid}")
+                except Exception as e:
+                    print(f"    Debug: Exception fetching INTERNALDATE for '{folder_name}' UID {highest_uid}: {e}")
+                
+                # Fetch SUBJECT separately
+                subject_str = None
+                try:
+                    res_subj, data_subj = mail.uid('FETCH', highest_uid, '(BODY.PEEK[HEADER.FIELDS (SUBJECT)])')
+                    if res_subj != 'OK':
+                        print(f"    Debug: UID FETCH SUBJECT failed for '{folder_name}' UID {highest_uid}: status={res_subj}")
+                    elif not data_subj:
+                        print(f"    Debug: UID FETCH SUBJECT returned no data for '{folder_name}' UID {highest_uid}")
+                    else:
+                        for item in data_subj:
+                            if isinstance(item, tuple) and len(item) >= 2:
+                                header_data = item[1]
+                                if isinstance(header_data, bytes):
                                     try:
-                                        mail.close()
-                                    except Exception:
-                                        pass
-                                    return None, None
-                            except Exception:
-                                # If test fetch fails, the folder might not be accessible
-                                try:
-                                    mail.close()
-                                except Exception:
-                                    pass
-                                return None, None
-                            # The highest message number is the most recent
-                            # Try to fetch from highest message number down (in case highest is not accessible)
-                            # Try up to 5 messages down from the highest
-                            max_attempts = min(5, msg_count)
-                            for attempt in range(max_attempts):
-                                try_msg_num = msg_count - attempt
-                                if try_msg_num < 1:
-                                    break
-                                
-                                try:
-                                    # Fetch headers (Date and Subject) using message number
-                                    res_header, data_header = mail.fetch(str(try_msg_num), '(BODY.PEEK[HEADER.FIELDS (DATE SUBJECT)])')
-                                    
-                                    date_str = None
-                                    subject_str = None
-                                    if res_header == 'OK' and data_header and len(data_header) > 0:
-                                        for item in data_header:
-                                            if isinstance(item, tuple) and len(item) >= 2:
-                                                header_data = item[1]
-                                                if isinstance(header_data, bytes):
-                                                    try:
-                                                        msg_header = email.message_from_bytes(header_data)
-                                                        # Get Date from header
-                                                        date_raw = msg_header.get('Date', '')
-                                                        if date_raw:
-                                                            try:
-                                                                msg_date = parsedate_to_datetime(date_raw)
-                                                                if msg_date:
-                                                                    date_str = date_raw
-                                                            except Exception:
-                                                                pass
-                                                        # Get Subject from header
-                                                        subject_raw = msg_header.get('Subject', '')
-                                                        if subject_raw:
-                                                            subject_str = decode_email_header(subject_raw)
-                                                    except Exception:
-                                                        pass
-                                    
-                                    # If we got date from header, use it; otherwise try INTERNALDATE
-                                    if not date_str:
-                                        try:
-                                            res_date, data_date = mail.fetch(str(try_msg_num), '(INTERNALDATE)')
-                                            if res_date == 'OK' and data_date:
-                                                date_str = parse_internal_date(data_date)
-                                        except Exception:
-                                            pass
-                                    
-                                    if date_str:
-                                        try:
-                                            msg_date = parsedate_to_datetime(date_str)
-                                            try:
-                                                mail.close()
-                                            except Exception:
-                                                pass
-                                            return msg_date, subject_str if subject_str else "(No Subject)"
-                                        except Exception:
-                                            pass
-                                    else:
-                                        # If we didn't get a date, continue to next attempt
-                                        continue
-                                    
-                                    # If we got here, we successfully got the date, so break
-                                    break
-                                except Exception:
-                                    # If this message number fails, try the next one
-                                    continue
-                            
-                            # If header fetch failed for all attempts, try INTERNALDATE only for highest message
+                                        msg_header = email.message_from_bytes(header_data)
+                                        subject_raw = msg_header.get('Subject', '')
+                                        if subject_raw:
+                                            subject_str = decode_email_header(subject_raw)
+                                            break
+                                    except Exception as e:
+                                        print(f"    Debug: Exception parsing SUBJECT for '{folder_name}' UID {highest_uid}: {e}")
+                except Exception as e:
+                    print(f"    Debug: Exception fetching SUBJECT for '{folder_name}' UID {highest_uid}: {e}")
+                
+                if date_str:
+                    try:
+                        msg_date = parsedate_to_datetime(date_str)
+                        try:
+                            mail.close()
+                        except Exception:
+                            pass
+                        return msg_date, subject_str if subject_str else "(No Subject)"
+                    except Exception as e:
+                        print(f"    Debug: Could not parse date string '{date_str}' for '{folder_name}': {e}")
+            except (ValueError, TypeError) as e:
+                print(f"    Debug: Error processing UIDs for '{folder_name}': {e}")
+        except Exception as e:
+            print(f"    Debug: Exception in UID SEARCH for '{folder_name}': {e}")
+        
+        # Method 2: Fallback to message number-based approach (if UID method failed)
+        # Try to fetch from highest message number down
+        max_attempts = min(20, msg_count)  # Try more messages
+        for attempt in range(max_attempts):
+            try_msg_num = msg_count - attempt
+            if try_msg_num < 1:
+                break
+            
+            try:
+                # Try INTERNALDATE first (more reliable than header Date)
+                res_date, data_date = mail.fetch(str(try_msg_num), '(INTERNALDATE)')
+                if res_date == 'OK' and data_date:
+                    date_str = parse_internal_date(data_date)
+                    if date_str:
+                        try:
+                            msg_date = parsedate_to_datetime(date_str)
+                            # Try to get subject
+                            subject_str = None
                             try:
-                                res_date, data_date = mail.fetch(str(msg_count), '(INTERNALDATE)')
-                                if res_date == 'OK' and data_date:
-                                    date_str = parse_internal_date(data_date)
-                                    if date_str:
-                                        try:
-                                            msg_date = parsedate_to_datetime(date_str)
-                                            try:
-                                                mail.close()
-                                            except Exception:
-                                                pass
-                                            return msg_date, "(No Subject)"
-                                        except Exception:
-                                            pass
+                                res_subj, data_subj = mail.fetch(str(try_msg_num), '(BODY.PEEK[HEADER.FIELDS (SUBJECT)])')
+                                if res_subj == 'OK' and data_subj:
+                                    for item in data_subj:
+                                        if isinstance(item, tuple) and len(item) >= 2:
+                                            header_data = item[1]
+                                            if isinstance(header_data, bytes):
+                                                try:
+                                                    msg_header = email.message_from_bytes(header_data)
+                                                    subject_raw = msg_header.get('Subject', '')
+                                                    if subject_raw:
+                                                        subject_str = decode_email_header(subject_raw)
+                                                        break
+                                                except Exception:
+                                                    pass
                             except Exception:
                                 pass
                             
@@ -824,145 +913,85 @@ def get_most_recent_email_info(mail, folder_name):
                                 mail.close()
                             except Exception:
                                 pass
-        except Exception:
-            pass
-        
-        # Method 2: Use UID SEARCH as fallback
-        try:
-            # First, examine the folder (read-only)
-            status, data = mail.examine(folder_name)
-            if status != 'OK':
-                # Try with quoted folder name
-                try:
-                    status, data = mail.examine(f'"{folder_name}"')
-                except Exception:
-                    pass
-                if status != 'OK':
-                    return None, None
-            
-            # Search for all UIDs
-            status, uids = mail.uid('SEARCH', None, 'ALL')
-            if status == 'OK' and uids and uids[0]:
-                uid_bytes = uids[0]
-                if isinstance(uid_bytes, bytes):
-                    uid_str = uid_bytes.decode('utf-8', errors='ignore')
-                else:
-                    uid_str = str(uid_bytes)
-                
-                # Parse UIDs
-                uid_list = [uid.strip() for uid in uid_str.split() if uid.strip()]
-                if uid_list:
-                    # Get the highest UID (most recent)
-                    try:
-                        # Filter to only numeric UIDs and find max
-                        numeric_uids = [uid for uid in uid_list if uid.isdigit()]
-                        if numeric_uids:
-                            highest_uid = max(numeric_uids, key=lambda x: int(x))
-                            
-                            # Fetch INTERNALDATE first
-                            res_date, data_date = mail.uid('FETCH', highest_uid, '(INTERNALDATE)')
-                            date_str = None
-                            if res_date == 'OK' and data_date:
-                                date_str = parse_internal_date(data_date)
-                            
-                            # Fetch SUBJECT separately
-                            res_subj, data_subj = mail.uid('FETCH', highest_uid, '(BODY.PEEK[HEADER.FIELDS (SUBJECT)])')
-                            subject_str = None
-                            if res_subj == 'OK' and data_subj:
-                                for item in data_subj:
-                                    if isinstance(item, tuple) and len(item) >= 2:
-                                        header_data = item[1]
-                                        if isinstance(header_data, bytes):
-                                            try:
-                                                msg_header = email.message_from_bytes(header_data)
-                                                subject_raw = msg_header.get('Subject', '')
-                                                if subject_raw:
-                                                    subject_str = decode_email_header(subject_raw)
-                                            except Exception:
-                                                pass
-                            
-                            if date_str:
-                                try:
-                                    msg_date = parsedate_to_datetime(date_str)
-                                    try:
-                                        mail.close()
-                                    except Exception:
-                                        pass
-                                    return msg_date, subject_str if subject_str else "(No Subject)"
-                                except Exception:
-                                    pass
-                    except (ValueError, TypeError) as e:
-                        pass
-            try:
-                mail.close()
+                            return msg_date, subject_str if subject_str else "(No Subject)"
+                        except Exception:
+                            pass
             except Exception:
-                pass
-        except Exception:
-            pass
+                continue
         
         # Clean up
         try:
             mail.close()
         except Exception:
             pass
+            
     except Exception as e:
-        # Debug: print error if needed (commented out for production)
-        # print(f"Error in get_most_recent_email_info for {folder_name}: {e}")
-        pass
+        # If we get here, something went wrong - try to clean up
+        print(f"    Debug: Unexpected exception in get_most_recent_email_info for '{folder_name}': {e}")
+        try:
+            mail.close()
+        except Exception:
+            pass
     
     return None, None
 
 def parse_internal_date(data_date):
-    """Parses INTERNALDATE from IMAP FETCH response"""
+    """Parses INTERNALDATE from IMAP FETCH response
+    Handles both regular FETCH and UID FETCH response formats
+    """
     date_str = None
     if not data_date:
         return None
     
+    # Build full response string from all items
+    full_response = ""
     for item in data_date:
-        if isinstance(item, tuple) and len(item) >= 2:
-            # Try to decode the response
-            date_response = item[1]
-            if isinstance(date_response, bytes):
-                date_response = date_response.decode('utf-8', errors='ignore')
-            else:
-                date_response = str(date_response)
-            
-            # Try various patterns for INTERNALDATE
-            # Pattern 1: INTERNALDATE "21-Nov-2025 13:10:45 +0000"
-            date_match = re.search(r'INTERNALDATE\s+"([^"]+)"', date_response)
-            if date_match:
-                date_str = date_match.group(1)
-                break
-            
-            # Pattern 2: INTERNALDATE 21-Nov-2025 13:10:45 +0000 (without quotes)
-            date_match = re.search(r'INTERNALDATE\s+([^\s)]+)', date_response)
-            if date_match:
-                date_str = date_match.group(1)
-                # If it doesn't include timezone, try to get more
-                if len(date_str) < 20:  # Short date, might need more
-                    extended_match = re.search(r'INTERNALDATE\s+([^\s)]+\s+[^\s)]+)', date_response)
-                    if extended_match:
-                        date_str = extended_match.group(1)
-                break
-            
-            # Pattern 3: (INTERNALDATE "21-Nov-2025 13:10:45 +0000")
-            date_match = re.search(r'\(INTERNALDATE\s+"([^"]+)"\)', date_response)
-            if date_match:
-                date_str = date_match.group(1)
-                break
-            
-            # Pattern 4: Look for date-like patterns in the response
-            # IMAP date format: DD-MMM-YYYY HH:MM:SS +HHMM
-            date_match = re.search(r'(\d{1,2}-[A-Za-z]{3}-\d{4}\s+\d{1,2}:\d{2}:\d{2})', date_response)
-            if date_match:
-                date_str = date_match.group(1)
-                # Try to get timezone if present
-                tz_match = re.search(r'(\d{1,2}-[A-Za-z]{3}-\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[+-]\d{4})', date_response)
-                if tz_match:
-                    date_str = tz_match.group(1)
-                break
+        if isinstance(item, tuple):
+            # Tuple format: (b'1 (INTERNALDATE "21-Nov-2025 13:10:45 +0000")', b'...')
+            # or: (b'1 (INTERNALDATE "21-Nov-2025 13:10:45 +0000")')
+            for part in item:
+                if isinstance(part, bytes):
+                    full_response += part.decode('utf-8', errors='ignore') + " "
+                else:
+                    full_response += str(part) + " "
+        elif isinstance(item, bytes):
+            full_response += item.decode('utf-8', errors='ignore') + " "
+        else:
+            full_response += str(item) + " "
     
-    return date_str
+    # Try various patterns for INTERNALDATE
+    # Pattern 1: INTERNALDATE "21-Nov-2025 13:10:45 +0000" (with quotes)
+    date_match = re.search(r'INTERNALDATE\s+"([^"]+)"', full_response)
+    if date_match:
+        return date_match.group(1)
+    
+    # Pattern 2: (INTERNALDATE "21-Nov-2025 13:10:45 +0000") (in parentheses with quotes)
+    date_match = re.search(r'\(INTERNALDATE\s+"([^"]+)"\)', full_response)
+    if date_match:
+        return date_match.group(1)
+    
+    # Pattern 3: INTERNALDATE 21-Nov-2025 13:10:45 +0000 (without quotes, with timezone)
+    date_match = re.search(r'INTERNALDATE\s+(\d{1,2}-[A-Za-z]{3}-\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[+-]\d{4})', full_response)
+    if date_match:
+        return date_match.group(1)
+    
+    # Pattern 4: INTERNALDATE 21-Nov-2025 13:10:45 +0000 (without quotes, try to get full)
+    date_match = re.search(r'INTERNALDATE\s+([^\s)]+\s+[^\s)]+\s+[^\s)]+)', full_response)
+    if date_match:
+        return date_match.group(1)
+    
+    # Pattern 5: Look for date-like patterns in the response (IMAP date format)
+    # IMAP date format: DD-MMM-YYYY HH:MM:SS +HHMM
+    date_match = re.search(r'(\d{1,2}-[A-Za-z]{3}-\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[+-]\d{4})', full_response)
+    if date_match:
+        return date_match.group(1)
+    
+    # Pattern 6: Date without timezone
+    date_match = re.search(r'(\d{1,2}-[A-Za-z]{3}-\d{4}\s+\d{1,2}:\d{2}:\d{2})', full_response)
+    if date_match:
+        return date_match.group(1)
+    
+    return None
 
 def parse_rfc822_size(data_size):
     """Parses RFC822.SIZE from IMAP FETCH response"""
@@ -1313,17 +1342,12 @@ def display_folder_counts(mail, all_folder_names, is_first_run=False):
         
         msg_count = get_message_count(mail, folder_name)
         
-        # Abort if we can't get message count and it's first run
-        if msg_count is None and is_first_run:
-            print(f"\n" + "="*70)
-            print(f"FIRST RUN FAILED: Could not retrieve message count for folder '{folder_name}'")
-            print("="*70)
-            print("The script is aborting to commandline as this is the first run.")
-            print("Please verify your Gmail account settings and IMAP access.")
-            print("="*70)
+        # Log warning if we can't get message count, but don't abort
+        # The actual spam folder selection will handle critical failures
+        if msg_count is None:
+            print(f"  Warning: Could not retrieve message count for folder '{folder_name}'")
+            print(f"  Continuing...")
             sys.stdout.flush()
-            cleanup_logging()
-            sys.exit(1)
         
         most_recent_date = None
         most_recent_subject = None
@@ -1332,18 +1356,12 @@ def display_folder_counts(mail, all_folder_names, is_first_run=False):
         if msg_count is not None and msg_count > 0:
             most_recent_date, most_recent_subject = get_most_recent_email_info(mail, folder_name)
             
-            # Abort if we can't get most recent email info and there are messages
-            if most_recent_date is None and is_first_run:
-                print(f"\n" + "="*70)
-                print(f"FIRST RUN FAILED: Could not retrieve most recent email for folder '{folder_name}'")
-                print(f"Folder has {msg_count} messages but most recent email info could not be retrieved.")
-                print("="*70)
-                print("The script is aborting to commandline as this is the first run.")
-                print("Please verify your Gmail account settings and IMAP access.")
-                print("="*70)
+            # Log warning if we can't get most recent email info, but don't abort
+            # The actual spam folder selection will handle critical failures
+            if most_recent_date is None:
+                print(f"  Warning: Could not retrieve most recent email info for folder '{folder_name}' ({msg_count} messages)")
+                print(f"  Continuing...")
                 sys.stdout.flush()
-                cleanup_logging()
-                sys.exit(1)
         
         folder_counts.append((folder_name, msg_count, most_recent_date, most_recent_subject))
         
