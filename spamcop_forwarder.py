@@ -2197,9 +2197,20 @@ def print_statistics(downloaded_files, total_size_bytes, timestamps):
     sys.stdout.flush()
     
     if timestamps:
-        timestamps.sort()
-        earliest = timestamps[0]
-        latest = timestamps[-1]
+        # Normalize timestamps to all be timezone-aware (UTC) before sorting
+        # This fixes the error when comparing offset-naive and offset-aware datetimes
+        normalized_timestamps = []
+        for dt in timestamps:
+            if dt.tzinfo is None:
+                # If naive, assume UTC
+                normalized_timestamps.append(dt.replace(tzinfo=datetime.timezone.utc))
+            else:
+                # If already aware, convert to UTC for consistency
+                normalized_timestamps.append(dt.astimezone(datetime.timezone.utc))
+        
+        normalized_timestamps.sort()
+        earliest = normalized_timestamps[0]
+        latest = normalized_timestamps[-1]
         span = latest - earliest
         print(f"Earliest Email:    {earliest}")
         print(f"Latest Email:      {latest}")
