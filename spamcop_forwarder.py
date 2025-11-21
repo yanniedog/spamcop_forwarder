@@ -8,6 +8,7 @@ import datetime
 import time
 import re
 import atexit
+import traceback
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
@@ -47,55 +48,27 @@ LOG_FILE = 'spamcop_forwarder.log'  # Logfile that appends all output
 # ==========================================
 
 class TeeOutput:
-    """Class that writes to both stdout and a logfile simultaneously"""
-    def __init__(self, logfile_path, overwrite=False):
-        self.terminal = sys.stdout
-        self.logfile = None
-        self.logfile_path = logfile_path
-        self._open_logfile(overwrite)
-    
-    def _open_logfile(self, overwrite=False):
-        """Opens the logfile in write mode (overwrite) or append mode"""
-        try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            log_path = os.path.join(script_dir, self.logfile_path)
-            mode = 'w' if overwrite else 'a'
-            self.logfile = open(log_path, mode, encoding='utf-8', buffering=1)  # Line buffered
-        except Exception as e:
-            # If we can't open logfile, just use terminal
-            print(f"Warning: Could not open logfile '{self.logfile_path}': {e}", file=sys.stderr)
-            self.logfile = None
-    
-    def _strip_ansi(self, text):
-        """Strips ANSI escape codes from text"""
-        # Remove ANSI escape sequences (re is already imported at module level)
-        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-        return ansi_escape.sub('', text)
+    """Class that writes to both a terminal stream and a logfile simultaneously"""
+    def __init__(self, terminal_stream, logfile_handle):
+        self.terminal = terminal_stream
+        self.logfile = logfile_handle
     
     def write(self, message):
         """Writes to both terminal and logfile"""
-        # Write to terminal with encoding error handling
+        # Write to terminal
         try:
             self.terminal.write(message)
             self.terminal.flush()
-        except (UnicodeEncodeError, AttributeError):
-            # If terminal can't handle Unicode, encode with error handling
+        except Exception:
+            # Fallback for terminal encoding issues
             try:
-                # Get terminal encoding or default to utf-8
-                encoding = getattr(self.terminal, 'encoding', None) or 'utf-8'
-                safe_message = message.encode(encoding, errors='replace').decode(encoding, errors='replace')
-                self.terminal.write(safe_message)
+                encoding = getattr(self.terminal, 'encoding', 'utf-8') or 'utf-8'
+                self.terminal.write(message.encode(encoding, errors='replace').decode(encoding))
                 self.terminal.flush()
             except Exception:
-                # If all else fails, try ASCII replacement
-                try:
-                    safe_message = message.encode('ascii', errors='replace').decode('ascii')
-                    self.terminal.write(safe_message)
-                    self.terminal.flush()
-                except Exception:
-                    pass  # Give up on terminal output
-        
-        # Write to logfile (already has error handling)
+                pass
+
+        # Write to logfile
         if self.logfile:
             try:
                 # Strip ANSI codes before writing to log file
@@ -103,122 +76,101 @@ class TeeOutput:
                 self.logfile.write(clean_message)
                 self.logfile.flush()
             except Exception:
-                # If logfile write fails, continue without it
                 pass
-    
+
     def flush(self):
         """Flushes both terminal and logfile"""
-        self.terminal.flush()
+        try:
+            self.terminal.flush()
+        except Exception:
+            pass
         if self.logfile:
             try:
                 self.logfile.flush()
             except Exception:
                 pass
     
-    def close(self):
-        """Closes the logfile"""
-        if self.logfile:
-            try:
-                self.logfile.close()
-            except Exception:
-                pass
+    def _strip_ansi(self, text):
+        """Strips ANSI escape codes from text"""
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        return ansi_escape.sub('', text)
+    
+    def isatty(self):
+        """Delegate isatty to the terminal stream"""
+        return getattr(self.terminal, 'isatty', lambda: False)()
 
 def is_initial_run_internal():
-    """Determines if this is the initial run by checking logfile and download history
-    Returns True if this appears to be the first run, False otherwise
-    Uses STRICT criteria - only returns False if there's STRONG evidence of completed runs
-    """
+    """Determines if this is the initial run by checking logfile and download history"""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     log_path = os.path.join(script_dir, LOG_FILE)
     
     # Check if logfile exists
     if not os.path.exists(log_path):
-        return True  # No logfile = first run
+        return True
     
-    # Check if logfile is empty or very small (just created)
+    # Check if logfile is empty or very small
     try:
-        if os.path.getsize(log_path) < 100:  # Less than 100 bytes = likely just created
+        if os.path.getsize(log_path) < 100:
             return True
     except Exception:
         pass
     
     # Check logfile content for STRONG evidence of successful previous runs
-    # We are VERY conservative - only skip deletion if there's CLEAR evidence of multiple COMPLETED runs
-    # Default behavior: DELETE the logfile (treat as initial run) to start fresh
     try:
         with open(log_path, 'r', encoding='utf-8') as f:
             content = f.read()
-            
-            # Only return False (don't delete) if we have VERY CLEAR evidence of MANY successful runs WITH actual spam processing
-            # Default behavior: DELETE the logfile to start fresh (treat as initial run)
-            # Only keep logfile if there's overwhelming evidence of many successful runs that actually processed spam
-            
             run_ended_count = content.count('RUN ENDED:')
             
-            # Check for evidence of ACTUAL spam processing (not just folder checking)
             has_actual_processing = (
                 ('DOWNLOAD STATISTICS' in content and 'Total Emails:' in content and 'Total Emails:      0' not in content) or
                 ('SUCCESS: Report sent to SpamCop' in content) or
                 ('Would send email:' in content and 'SIMULATION MODE' in content and 'Total Emails:' in content)
             )
             
-            # Require BOTH:
-            # 1. At least 10 completed runs (many successful sessions)
-            # 2. Evidence of actual spam processing (not just folder checking)
-            # This ensures we only keep logfiles from well-established runs that actually processed spam
-            # For most cases, we'll delete and start fresh
             if run_ended_count >= 10 and has_actual_processing:
                 return False
-                
     except Exception:
-        # If we can't read the logfile, treat as first run (safer to delete and start fresh)
         return True
     
-    # If logfile exists but has weak/no evidence of successful runs, check download directory
-    # Note: BASE_DIRECTORY might not be defined yet when this is called early
+    # Check download directory if possible
     try:
-        # Try to access BASE_DIRECTORY from the module's globals
         import sys
         current_module = sys.modules[__name__]
         if hasattr(current_module, 'BASE_DIRECTORY'):
             base_dir = getattr(current_module, 'BASE_DIRECTORY')
             if base_dir and os.path.exists(base_dir):
-                # Check if there are any downloaded spam folders
                 download_items = os.listdir(base_dir)
                 if download_items:
-                    # Has downloads = not first run
                     return False
-    except (NameError, AttributeError, Exception):
-        # BASE_DIRECTORY not defined yet or other error - skip this check
+    except Exception:
         pass
     
-    # Default: if logfile exists but has weak evidence, treat as first run (delete and start fresh)
     return True
 
 def setup_logging():
-    """Sets up logging to both console and logfile"""
+    """Sets up logging to both console and logfile, capturing stdout and stderr"""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     log_path = os.path.join(script_dir, LOG_FILE)
     
     # Determine if this is the initial run using internal checks
     is_initial_run = is_initial_run_internal()
     
-    # Wipe logfile contents on initial run (truncate to empty)
-    # This works even if the file is open/locked by another process
-    if is_initial_run:
-        if os.path.exists(log_path):
-            try:
-                # Truncate the file to empty - this works even if file is open
-                with open(log_path, 'w', encoding='utf-8') as f:
-                    f.write('')  # Wipe contents - effectively a fresh start
-            except Exception as e:
-                print(f"Warning: Could not wipe logfile '{log_path}': {e}", file=sys.stderr)
+    # Open logfile
+    mode = 'w' if is_initial_run else 'a'
+    try:
+        log_file = open(log_path, mode, encoding='utf-8', buffering=1)
+    except Exception as e:
+        print(f"Warning: Could not open logfile '{log_path}': {e}", file=sys.stderr)
+        log_file = None
     
-    # Replace stdout with TeeOutput (always append mode, since we deleted on initial run)
-    tee = TeeOutput(LOG_FILE, overwrite=False)
-    sys.stdout = tee
+    # Replace stdout and stderr with TeeOutput
+    stdout_tee = TeeOutput(sys.stdout, log_file)
+    stderr_tee = TeeOutput(sys.stderr, log_file)
     
-    # Now write the header
+    sys.stdout = stdout_tee
+    sys.stderr = stderr_tee
+    
+    # Write header
     timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     if not is_initial_run:
         print(f"\n{'='*80}")
@@ -226,10 +178,10 @@ def setup_logging():
     print(f"{'='*80}\n")
     sys.stdout.flush()
     
-    return tee, is_initial_run
+    return log_file, is_initial_run
 
 # Set up logging before any other output
-_log_tee, _is_initial_run_global = setup_logging()
+_log_file, _is_initial_run_global = setup_logging()
 
 # Register cleanup function to close logfile on exit
 _log_cleanup_done = False
@@ -238,24 +190,25 @@ def cleanup_logging():
     """Closes the logfile when script exits"""
     global _log_cleanup_done
     if _log_cleanup_done:
-        return  # Already cleaned up
+        return
     _log_cleanup_done = True
     
-    if _log_tee:
+    # Restore original streams if possible (wrapped in TeeOutput)
+    if hasattr(sys.stdout, 'terminal'):
+        sys.stdout = sys.stdout.terminal
+    if hasattr(sys.stderr, 'terminal'):
+        sys.stderr = sys.stderr.terminal
+    
+    if _log_file:
         try:
-            # Write a closing message to logfile
-            if _log_tee.logfile:
-                timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                _log_tee.logfile.write(f"\n{'='*80}\n")
-                _log_tee.logfile.write(f"RUN ENDED: {timestamp}\n")
-                _log_tee.logfile.write(f"{'='*80}\n\n")
-                _log_tee.logfile.flush()
+            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            _log_file.write(f"\n{'='*80}\n")
+            _log_file.write(f"RUN ENDED: {timestamp}\n")
+            _log_file.write(f"{'='*80}\n\n")
+            _log_file.flush()
+            _log_file.close()
         except Exception:
             pass
-        
-        _log_tee.close()
-        # Restore original stdout
-        sys.stdout = _log_tee.terminal
 
 atexit.register(cleanup_logging)
 
@@ -713,227 +666,71 @@ def get_message_count(mail, folder_name):
 def get_most_recent_email_info(mail, folder_name):
     """Gets the date/time and subject of the most recent email in a folder
     Returns: (date_datetime, subject_string) or (None, None) if not found
-    Uses UID-based methods which are more reliable for folders with special characters
+    Uses fetch('*') which is significantly faster than UID SEARCH
     """
-    # Try multiple methods to examine/select the folder
-    # Folder names with special characters need different handling
-    folder_selected = False
-    selected_data = None
-    last_error = None
-    
-    # Try different ways to select/examine the folder
-    select_methods = [
-        lambda: mail.examine(folder_name),
-        lambda: mail.examine(f'"{folder_name}"'),
-        lambda: mail.select(folder_name, readonly=True),
-        lambda: mail.select(f'"{folder_name}"', readonly=True),
-    ]
-    
-    for select_method in select_methods:
-        try:
-            status, data = select_method()
-            if status == 'OK':
-                folder_selected = True
-                selected_data = data
-                break
-        except Exception as e:
-            last_error = e
-            continue
-    
-    if not folder_selected:
-        # Could not select folder - return None
-        # Only log if it's a real error (not just trying different methods)
-        if last_error and 'examine' not in str(last_error).lower():
-            print(f"    Debug: Could not select folder '{folder_name}': {last_error}")
-        return None, None
-    
     try:
-        # Get message count from SELECT/EXAMINE response
-        msg_count = 0
-        if selected_data:
-            for item in selected_data:
-                if isinstance(item, bytes):
-                    item_str = item.decode('utf-8', errors='ignore')
-                else:
-                    item_str = str(item)
-                count_match = re.search(r'(\d+)\s+EXISTS', item_str, re.IGNORECASE)
-                if count_match:
-                    msg_count = int(count_match.group(1))
-                    break
+        # Select folder (readonly)
+        # Handle folder names with spaces/special chars if needed
+        target_folder = f'"{folder_name}"' if ' ' in folder_name and '"' not in folder_name else folder_name
+        status, data = mail.select(target_folder, readonly=True)
         
-        if msg_count == 0:
-            # No messages in folder
+        if status != 'OK':
+            # Try quoting if not quoted as fallback
+            if '"' not in folder_name:
+                 status, data = mail.select(f'"{folder_name}"', readonly=True)
+        
+        if status != 'OK':
+             return None, None
+
+        # Fetch the last message (*)
+        # We want INTERNALDATE and SUBJECT
+        status, data = mail.fetch('*', '(INTERNALDATE BODY.PEEK[HEADER.FIELDS (SUBJECT)])')
+        
+        if status != 'OK' or not data or data == [None]:
             try:
                 mail.close()
-            except Exception:
+            except:
                 pass
             return None, None
-        
-        # Method 1: Use UID SEARCH (most reliable, especially for folders with special characters)
-        try:
-            # Search for all UIDs
-            status, uids = mail.uid('SEARCH', None, 'ALL')
-            if status != 'OK':
-                print(f"    Debug: UID SEARCH failed for '{folder_name}': status={status}")
-                try:
-                    mail.close()
-                except Exception:
-                    pass
-                return None, None
-                
-            if not uids or not uids[0]:
-                # Empty folder (shouldn't happen since msg_count > 0, but handle it)
-                try:
-                    mail.close()
-                except Exception:
-                    pass
-                return None, None
-                
-            uid_bytes = uids[0]
-            if isinstance(uid_bytes, bytes):
-                uid_str = uid_bytes.decode('utf-8', errors='ignore')
-            else:
-                uid_str = str(uid_bytes)
             
-            # Parse UIDs
-            uid_list = [uid.strip() for uid in uid_str.split() if uid.strip()]
-            if not uid_list:
-                print(f"    Debug: No UIDs found for '{folder_name}' despite {msg_count} messages")
-                try:
-                    mail.close()
-                except Exception:
-                    pass
-                return None, None
-                
-            # Get the highest UID (most recent)
-            try:
-                # Filter to only numeric UIDs and find max
-                numeric_uids = [uid for uid in uid_list if uid.isdigit()]
-                if not numeric_uids:
-                    print(f"    Debug: No numeric UIDs found for '{folder_name}' (UIDs: {uid_list[:5]}...)")
-                    try:
-                        mail.close()
-                    except Exception:
-                        pass
-                    return None, None
-                    
-                highest_uid = max(numeric_uids, key=lambda x: int(x))
-                
-                # Fetch INTERNALDATE first (more reliable than header Date)
-                date_str = None
-                try:
-                    res_date, data_date = mail.uid('FETCH', highest_uid, '(INTERNALDATE)')
-                    if res_date != 'OK':
-                        print(f"    Debug: UID FETCH INTERNALDATE failed for '{folder_name}' UID {highest_uid}: status={res_date}")
-                    elif not data_date:
-                        print(f"    Debug: UID FETCH INTERNALDATE returned no data for '{folder_name}' UID {highest_uid}")
-                    else:
-                        date_str = parse_internal_date(data_date)
-                        if not date_str:
-                            print(f"    Debug: Could not parse INTERNALDATE for '{folder_name}' UID {highest_uid}")
-                except Exception as e:
-                    print(f"    Debug: Exception fetching INTERNALDATE for '{folder_name}' UID {highest_uid}: {e}")
-                
-                # Fetch SUBJECT separately
-                subject_str = None
-                try:
-                    res_subj, data_subj = mail.uid('FETCH', highest_uid, '(BODY.PEEK[HEADER.FIELDS (SUBJECT)])')
-                    if res_subj != 'OK':
-                        print(f"    Debug: UID FETCH SUBJECT failed for '{folder_name}' UID {highest_uid}: status={res_subj}")
-                    elif not data_subj:
-                        print(f"    Debug: UID FETCH SUBJECT returned no data for '{folder_name}' UID {highest_uid}")
-                    else:
-                        for item in data_subj:
-                            if isinstance(item, tuple) and len(item) >= 2:
-                                header_data = item[1]
-                                if isinstance(header_data, bytes):
-                                    try:
-                                        msg_header = email.message_from_bytes(header_data)
-                                        subject_raw = msg_header.get('Subject', '')
-                                        if subject_raw:
-                                            subject_str = decode_email_header(subject_raw)
-                                            break
-                                    except Exception as e:
-                                        print(f"    Debug: Exception parsing SUBJECT for '{folder_name}' UID {highest_uid}: {e}")
-                except Exception as e:
-                    print(f"    Debug: Exception fetching SUBJECT for '{folder_name}' UID {highest_uid}: {e}")
-                
-                if date_str:
-                    try:
-                        msg_date = parsedate_to_datetime(date_str)
-                        try:
-                            mail.close()
-                        except Exception:
-                            pass
-                        return msg_date, subject_str if subject_str else "(No Subject)"
-                    except Exception as e:
-                        print(f"    Debug: Could not parse date string '{date_str}' for '{folder_name}': {e}")
-            except (ValueError, TypeError) as e:
-                print(f"    Debug: Error processing UIDs for '{folder_name}': {e}")
-        except Exception as e:
-            print(f"    Debug: Exception in UID SEARCH for '{folder_name}': {e}")
+        # Parse response using existing helpers
+        date_str = parse_internal_date(data)
         
-        # Method 2: Fallback to message number-based approach (if UID method failed)
-        # Try to fetch from highest message number down
-        max_attempts = min(20, msg_count)  # Try more messages
-        for attempt in range(max_attempts):
-            try_msg_num = msg_count - attempt
-            if try_msg_num < 1:
-                break
-            
-            try:
-                # Try INTERNALDATE first (more reliable than header Date)
-                res_date, data_date = mail.fetch(str(try_msg_num), '(INTERNALDATE)')
-                if res_date == 'OK' and data_date:
-                    date_str = parse_internal_date(data_date)
-                    if date_str:
-                        try:
-                            msg_date = parsedate_to_datetime(date_str)
-                            # Try to get subject
-                            subject_str = None
-                            try:
-                                res_subj, data_subj = mail.fetch(str(try_msg_num), '(BODY.PEEK[HEADER.FIELDS (SUBJECT)])')
-                                if res_subj == 'OK' and data_subj:
-                                    for item in data_subj:
-                                        if isinstance(item, tuple) and len(item) >= 2:
-                                            header_data = item[1]
-                                            if isinstance(header_data, bytes):
-                                                try:
-                                                    msg_header = email.message_from_bytes(header_data)
-                                                    subject_raw = msg_header.get('Subject', '')
-                                                    if subject_raw:
-                                                        subject_str = decode_email_header(subject_raw)
-                                                        break
-                                                except Exception:
-                                                    pass
-                            except Exception:
-                                pass
-                            
-                            try:
-                                mail.close()
-                            except Exception:
-                                pass
-                            return msg_date, subject_str if subject_str else "(No Subject)"
-                        except Exception:
-                            pass
-            except Exception:
-                continue
+        # Extract subject
+        subject_str = "(No Subject)"
+        for item in data:
+             if isinstance(item, tuple) and len(item) >= 2:
+                 header_chunk = item[1]
+                 if isinstance(header_chunk, bytes):
+                     try:
+                         msg_header = email.message_from_bytes(header_chunk)
+                         raw_sub = msg_header.get('Subject', '')
+                         if raw_sub:
+                             subject_str = decode_email_header(raw_sub)
+                     except:
+                         pass
         
-        # Clean up
+        msg_date = None
+        if date_str:
+            try:
+                msg_date = parsedate_to_datetime(date_str)
+            except:
+                pass
+                
         try:
             mail.close()
-        except Exception:
+        except:
             pass
             
-    except Exception as e:
-        # If we get here, something went wrong - try to clean up
-        print(f"    Debug: Unexpected exception in get_most_recent_email_info for '{folder_name}': {e}")
+        return msg_date, subject_str
+
+    except Exception:
+        # Fail silently for folder access issues (common with Gmail special folders)
         try:
             mail.close()
-        except Exception:
+        except:
             pass
-    
-    return None, None
+        return None, None
 
 def parse_internal_date(data_date):
     """Parses INTERNALDATE from IMAP FETCH response
@@ -1823,7 +1620,7 @@ def _handle_first_run_confirmation(first_run_flag_file, downloaded_files, spam_c
     while True:
         response = input("Have you verified that ALL downloaded emails are spam? (yes/no): ").strip().lower()
         if response in ['yes', 'y']:
-            print("\n✓ Confirmation received. Proceeding with forwarding to SpamCop...")
+            print("\n[OK] Confirmation received. Proceeding with forwarding to SpamCop...")
             sys.stdout.flush()
             try:
                 with open(first_run_flag_file, 'w') as f:
@@ -1998,7 +1795,7 @@ def run_spam_processor():
                 # - Listed folders
                 # - Displayed folder counts (or would have if not aborted)
                 # - Selected spam folder (or would have if not aborted)
-                print(f"\n✓ Initial setup completed successfully.")
+                print(f"\n[OK] Initial setup completed successfully.")
                 print("The script has successfully connected and verified folder access.")
                 sys.stdout.flush()
                 initial_setup_completed = True
