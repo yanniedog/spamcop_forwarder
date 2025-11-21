@@ -7,6 +7,7 @@ import sys
 import datetime
 import time
 import re
+import atexit
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
@@ -40,6 +41,130 @@ COMMON_SPAM_FOLDER_NAMES = [
 FIRST_RUN_FLAG_FILE = '.spamcop_first_run_complete'
 INITIAL_SETUP_FLAG_FILE = '.spamcop_initial'
 DEFAULT_SIZE_KB = 1024  # Default 1KB if size can't be determined
+LOG_FILE = 'spamcop_forwarder.log'  # Logfile that appends all output
+
+# ==========================================
+#              LOGGING SETUP
+# ==========================================
+
+class TeeOutput:
+    """Class that writes to both stdout and a logfile simultaneously"""
+    def __init__(self, logfile_path, overwrite=False):
+        self.terminal = sys.stdout
+        self.logfile = None
+        self.logfile_path = logfile_path
+        self._open_logfile(overwrite)
+    
+    def _open_logfile(self, overwrite=False):
+        """Opens the logfile in write mode (overwrite) or append mode"""
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            log_path = os.path.join(script_dir, self.logfile_path)
+            mode = 'w' if overwrite else 'a'
+            self.logfile = open(log_path, mode, encoding='utf-8', buffering=1)  # Line buffered
+        except Exception as e:
+            # If we can't open logfile, just use terminal
+            print(f"Warning: Could not open logfile '{self.logfile_path}': {e}", file=sys.stderr)
+            self.logfile = None
+    
+    def _strip_ansi(self, text):
+        """Strips ANSI escape codes from text"""
+        # Remove ANSI escape sequences (re is already imported at module level)
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        return ansi_escape.sub('', text)
+    
+    def write(self, message):
+        """Writes to both terminal and logfile"""
+        self.terminal.write(message)
+        self.terminal.flush()
+        if self.logfile:
+            try:
+                # Strip ANSI codes before writing to log file
+                clean_message = self._strip_ansi(message)
+                self.logfile.write(clean_message)
+                self.logfile.flush()
+            except Exception:
+                # If logfile write fails, continue without it
+                pass
+    
+    def flush(self):
+        """Flushes both terminal and logfile"""
+        self.terminal.flush()
+        if self.logfile:
+            try:
+                self.logfile.flush()
+            except Exception:
+                pass
+    
+    def close(self):
+        """Closes the logfile"""
+        if self.logfile:
+            try:
+                self.logfile.close()
+            except Exception:
+                pass
+
+def setup_logging():
+    """Sets up logging to both console and logfile"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_path = os.path.join(script_dir, LOG_FILE)
+    initial_flag_path = os.path.join(script_dir, INITIAL_SETUP_FLAG_FILE)
+    
+    # Check if this is the initial run (initial flag file doesn't exist)
+    # On initial run, delete the logfile; otherwise append
+    is_initial_run = not os.path.exists(initial_flag_path)
+    
+    # Delete logfile on initial run
+    if is_initial_run and os.path.exists(log_path):
+        try:
+            os.remove(log_path)
+        except Exception as e:
+            print(f"Warning: Could not delete logfile '{log_path}': {e}", file=sys.stderr)
+    
+    # Replace stdout with TeeOutput (always append mode, since we deleted on initial run)
+    tee = TeeOutput(LOG_FILE, overwrite=False)
+    sys.stdout = tee
+    
+    # Now write the header
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    if not is_initial_run:
+        print(f"\n{'='*80}")
+    print(f"NEW RUN STARTED: {timestamp}")
+    print(f"{'='*80}\n")
+    sys.stdout.flush()
+    
+    return tee
+
+# Set up logging before any other output
+_log_tee = setup_logging()
+
+# Register cleanup function to close logfile on exit
+_log_cleanup_done = False
+
+def cleanup_logging():
+    """Closes the logfile when script exits"""
+    global _log_cleanup_done
+    if _log_cleanup_done:
+        return  # Already cleaned up
+    _log_cleanup_done = True
+    
+    if _log_tee:
+        try:
+            # Write a closing message to logfile
+            if _log_tee.logfile:
+                timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                _log_tee.logfile.write(f"\n{'='*80}\n")
+                _log_tee.logfile.write(f"RUN ENDED: {timestamp}\n")
+                _log_tee.logfile.write(f"{'='*80}\n\n")
+                _log_tee.logfile.flush()
+        except Exception:
+            pass
+        
+        _log_tee.close()
+        # Restore original stdout
+        sys.stdout = _log_tee.terminal
+
+atexit.register(cleanup_logging)
 
 # ==========================================
 #              CONFIGURATION LOADING
@@ -106,6 +231,7 @@ SIMULATION_MODE = True  # Set to False to enable actual forwarding to SpamCop
             f.write(config_content)
         print(f"Created {config_path}")
         print("\nPlease edit the config file and replace the placeholders, then run the script again.")
+        cleanup_logging()
         sys.exit(1)
     
     # Import config
@@ -128,6 +254,7 @@ SIMULATION_MODE = True  # Set to False to enable actual forwarding to SpamCop
         
         if placeholders_found:
             print_config_instructions(placeholders_found)
+            cleanup_logging()
             sys.exit(1)
         
         # Return config values
@@ -148,6 +275,7 @@ SIMULATION_MODE = True  # Set to False to enable actual forwarding to SpamCop
     except Exception as e:
         print(f"Error loading configuration: {e}")
         print(f"Please check that {config_path} exists and is valid Python code.")
+        cleanup_logging()
         sys.exit(1)
 
 def print_config_instructions(missing_fields):
@@ -207,6 +335,7 @@ if not os.path.exists(BASE_DIRECTORY):
         print("The script may fail when trying to save downloaded emails.")
 elif not os.path.isdir(BASE_DIRECTORY):
     print(f"Error: '{BASE_DIRECTORY}' exists but is not a directory!")
+    cleanup_logging()
     sys.exit(1)
 
 # ==========================================
@@ -355,15 +484,54 @@ def parse_folder_from_list_response(folder):
         folder_str = str(folder)
     
     # Parse IMAP LIST response format: (\\HasNoChildren) "/" "INBOX"
-    # Extract the folder name (last quoted string or unquoted part)
+    # Or: (\\HasChildren \\Noselect) "/" "[Gmail]"
+    # Or: (\\HasNoChildren) "/" "[Gmail]/Spam"
+    # Gmail format: (attributes) "delimiter" "folder_name" or (attributes) delimiter folder_name
+    
     folder_name = None
-    quoted_match = re.search(r'"([^"]+)"', folder_str)
-    if quoted_match:
-        folder_name = quoted_match.group(1)
-    else:
+    
+    # Method 1: Look for quoted strings (most common format)
+    # Find all quoted strings
+    quoted_matches = re.findall(r'"([^"]+)"', folder_str)
+    if quoted_matches:
+        # The last quoted string is usually the folder name
+        # But sometimes there are multiple (delimiter and folder)
+        # For Gmail: (\\HasNoChildren) "/" "[Gmail]/Spam" -> folder is "[Gmail]/Spam"
+        # For simple: (\\HasNoChildren) "/" "INBOX" -> folder is "INBOX"
+        if len(quoted_matches) >= 2:
+            # If multiple quoted strings, the last one is the folder name
+            folder_name = quoted_matches[-1]
+        else:
+            folder_name = quoted_matches[0]
+    
+    # Method 2: If no quoted strings, try to extract from the end
+    if not folder_name:
+        # Split by spaces and take the last non-empty part
         parts = folder_str.split()
         if len(parts) > 0:
-            folder_name = parts[-1]
+            # Skip attributes (parts in parentheses) and delimiter
+            for part in reversed(parts):
+                if part and part not in ['/', '\\'] and not part.startswith('(') and not part.endswith(')'):
+                    folder_name = part
+                    break
+    
+    # Method 3: If still nothing, try to extract anything that looks like a folder name
+    if not folder_name:
+        # Look for patterns like [Gmail]/Spam or INBOX
+        pattern_match = re.search(r'([A-Za-z0-9\[\]/_-]+)', folder_str)
+        if pattern_match:
+            potential_name = pattern_match.group(1)
+            # Skip common delimiters and attributes
+            if potential_name not in ['/', '\\', 'HasNoChildren', 'HasChildren', 'Noselect']:
+                folder_name = potential_name
+    
+    # Clean up the folder name
+    if folder_name:
+        # Remove any remaining quotes
+        folder_name = folder_name.strip('"\'')
+        # If it's just "/" or empty, return None
+        if folder_name in ['/', '']:
+            return None
     
     return folder_name
 
@@ -449,20 +617,312 @@ def get_message_count(mail, folder_name):
     
     return None
 
+def get_most_recent_email_info(mail, folder_name):
+    """Gets the date/time and subject of the most recent email in a folder
+    Returns: (date_datetime, subject_string) or (None, None) if not found
+    """
+    try:
+        # Method 1: Use message number directly (most reliable for Gmail)
+        # Get message count first, then use the highest message number
+        try:
+            # Get message count using STATUS (doesn't require selecting folder)
+            status, message_count = mail.status(folder_name, "(MESSAGES)")
+            if status == 'OK' and message_count:
+                count_match = re.search(r'MESSAGES\s+(\d+)', str(message_count[0]))
+                if count_match:
+                    msg_count = int(count_match.group(1))
+                    if msg_count > 0:
+                        # Examine folder (read-only select)
+                        status, data = mail.examine(folder_name)
+                        if status != 'OK':
+                            # Try with quoted folder name
+                            try:
+                                status, data = mail.examine(f'"{folder_name}"')
+                            except Exception:
+                                pass
+                        
+                        if status == 'OK':
+                            # The highest message number is the most recent
+                            # Fetch INTERNALDATE first
+                            res_date, data_date = mail.fetch(str(msg_count), '(INTERNALDATE)')
+                            date_str = None
+                            if res_date == 'OK' and data_date:
+                                date_str = parse_internal_date(data_date)
+                            
+                            # Fetch SUBJECT separately
+                            res_subj, data_subj = mail.fetch(str(msg_count), '(BODY.PEEK[HEADER.FIELDS (SUBJECT)])')
+                            subject_str = None
+                            if res_subj == 'OK' and data_subj:
+                                for item in data_subj:
+                                    if isinstance(item, tuple) and len(item) >= 2:
+                                        header_data = item[1]
+                                        if isinstance(header_data, bytes):
+                                            try:
+                                                msg_header = email.message_from_bytes(header_data)
+                                                subject_raw = msg_header.get('Subject', '')
+                                                if subject_raw:
+                                                    subject_str = decode_email_header(subject_raw)
+                                            except Exception:
+                                                pass
+                            
+                            if date_str:
+                                try:
+                                    msg_date = parsedate_to_datetime(date_str)
+                                    try:
+                                        mail.close()
+                                    except Exception:
+                                        pass
+                                    return msg_date, subject_str if subject_str else "(No Subject)"
+                                except Exception:
+                                    pass
+                            try:
+                                mail.close()
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+        
+        # Method 2: Use UID SEARCH as fallback
+        try:
+            # First, examine the folder (read-only)
+            status, data = mail.examine(folder_name)
+            if status != 'OK':
+                # Try with quoted folder name
+                try:
+                    status, data = mail.examine(f'"{folder_name}"')
+                except Exception:
+                    pass
+                if status != 'OK':
+                    return None, None
+            
+            # Search for all UIDs
+            status, uids = mail.uid('SEARCH', None, 'ALL')
+            if status == 'OK' and uids and uids[0]:
+                uid_bytes = uids[0]
+                if isinstance(uid_bytes, bytes):
+                    uid_str = uid_bytes.decode('utf-8', errors='ignore')
+                else:
+                    uid_str = str(uid_bytes)
+                
+                # Parse UIDs
+                uid_list = [uid.strip() for uid in uid_str.split() if uid.strip()]
+                if uid_list:
+                    # Get the highest UID (most recent)
+                    try:
+                        # Filter to only numeric UIDs and find max
+                        numeric_uids = [uid for uid in uid_list if uid.isdigit()]
+                        if numeric_uids:
+                            highest_uid = max(numeric_uids, key=lambda x: int(x))
+                            
+                            # Fetch INTERNALDATE first
+                            res_date, data_date = mail.uid('FETCH', highest_uid, '(INTERNALDATE)')
+                            date_str = None
+                            if res_date == 'OK' and data_date:
+                                date_str = parse_internal_date(data_date)
+                            
+                            # Fetch SUBJECT separately
+                            res_subj, data_subj = mail.uid('FETCH', highest_uid, '(BODY.PEEK[HEADER.FIELDS (SUBJECT)])')
+                            subject_str = None
+                            if res_subj == 'OK' and data_subj:
+                                for item in data_subj:
+                                    if isinstance(item, tuple) and len(item) >= 2:
+                                        header_data = item[1]
+                                        if isinstance(header_data, bytes):
+                                            try:
+                                                msg_header = email.message_from_bytes(header_data)
+                                                subject_raw = msg_header.get('Subject', '')
+                                                if subject_raw:
+                                                    subject_str = decode_email_header(subject_raw)
+                                            except Exception:
+                                                pass
+                            
+                            if date_str:
+                                try:
+                                    msg_date = parsedate_to_datetime(date_str)
+                                    try:
+                                        mail.close()
+                                    except Exception:
+                                        pass
+                                    return msg_date, subject_str if subject_str else "(No Subject)"
+                                except Exception:
+                                    pass
+                    except (ValueError, TypeError) as e:
+                        pass
+            try:
+                mail.close()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        
+        # Method 2: Fallback - use message number if UID method fails
+        try:
+            # Get message count using STATUS
+            status, message_count = mail.status(folder_name, "(MESSAGES)")
+            if status == 'OK' and message_count:
+                count_match = re.search(r'MESSAGES\s+(\d+)', str(message_count[0]))
+                if count_match:
+                    msg_count = int(count_match.group(1))
+                    if msg_count > 0:
+                        # Examine folder to select it
+                        status, data = mail.examine(folder_name)
+                        if status == 'OK':
+                            # Fetch INTERNALDATE first
+                            res_date, data_date = mail.fetch(str(msg_count), '(INTERNALDATE)')
+                            date_str = None
+                            if res_date == 'OK' and data_date:
+                                date_str = parse_internal_date(data_date)
+                            
+                            # Fetch SUBJECT separately
+                            res_subj, data_subj = mail.fetch(str(msg_count), '(BODY.PEEK[HEADER.FIELDS (SUBJECT)])')
+                            subject_str = None
+                            if res_subj == 'OK' and data_subj:
+                                for item in data_subj:
+                                    if isinstance(item, tuple) and len(item) >= 2:
+                                        header_data = item[1]
+                                        if isinstance(header_data, bytes):
+                                            try:
+                                                msg_header = email.message_from_bytes(header_data)
+                                                subject_raw = msg_header.get('Subject', '')
+                                                if subject_raw:
+                                                    subject_str = decode_email_header(subject_raw)
+                                            except Exception:
+                                                pass
+                            
+                            if date_str:
+                                try:
+                                    msg_date = parsedate_to_datetime(date_str)
+                                    try:
+                                        mail.close()
+                                    except Exception:
+                                        pass
+                                    return msg_date, subject_str if subject_str else "(No Subject)"
+                                except Exception:
+                                    pass
+        except Exception:
+            pass
+        
+        # Method 3: Try examining and parsing EXISTS from response
+        try:
+            status, data = mail.examine(folder_name)
+            if status == 'OK':
+                # Parse message count from examine response
+                msg_count = 0
+                
+                # Check data array
+                if data:
+                    for item in data:
+                        item_str = item.decode() if isinstance(item, bytes) else str(item)
+                        exists_match = re.search(r'(\d+)\s*EXISTS', item_str, re.IGNORECASE)
+                        if exists_match:
+                            msg_count = int(exists_match.group(1))
+                            break
+                
+                # Also check the full response string
+                if msg_count == 0:
+                    full_response = str(data) if data else ""
+                    exists_match = re.search(r'(\d+)\s*EXISTS', full_response, re.IGNORECASE)
+                    if exists_match:
+                        msg_count = int(exists_match.group(1))
+                
+                if msg_count > 0:
+                    # Fetch INTERNALDATE first
+                    res_date, data_date = mail.fetch(str(msg_count), '(INTERNALDATE)')
+                    date_str = None
+                    if res_date == 'OK' and data_date:
+                        date_str = parse_internal_date(data_date)
+                    
+                    # Fetch SUBJECT separately
+                    res_subj, data_subj = mail.fetch(str(msg_count), '(BODY.PEEK[HEADER.FIELDS (SUBJECT)])')
+                    subject_str = None
+                    if res_subj == 'OK' and data_subj:
+                        for item in data_subj:
+                            if isinstance(item, tuple) and len(item) >= 2:
+                                header_data = item[1]
+                                if isinstance(header_data, bytes):
+                                    try:
+                                        msg_header = email.message_from_bytes(header_data)
+                                        subject_raw = msg_header.get('Subject', '')
+                                        if subject_raw:
+                                            subject_str = decode_email_header(subject_raw)
+                                    except Exception:
+                                        pass
+                    
+                    if date_str:
+                        try:
+                            msg_date = parsedate_to_datetime(date_str)
+                            try:
+                                mail.close()
+                            except Exception:
+                                pass
+                            return msg_date, subject_str if subject_str else "(No Subject)"
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        
+        # Clean up
+        try:
+            mail.close()
+        except Exception:
+            pass
+    except Exception as e:
+        # Debug: print error if needed (commented out for production)
+        # print(f"Error in get_most_recent_email_info for {folder_name}: {e}")
+        pass
+    
+    return None, None
+
 def parse_internal_date(data_date):
     """Parses INTERNALDATE from IMAP FETCH response"""
     date_str = None
+    if not data_date:
+        return None
+    
     for item in data_date:
         if isinstance(item, tuple) and len(item) >= 2:
-            date_response = item[1].decode() if isinstance(item[1], bytes) else str(item[1])
+            # Try to decode the response
+            date_response = item[1]
+            if isinstance(date_response, bytes):
+                date_response = date_response.decode('utf-8', errors='ignore')
+            else:
+                date_response = str(date_response)
+            
+            # Try various patterns for INTERNALDATE
+            # Pattern 1: INTERNALDATE "21-Nov-2025 13:10:45 +0000"
             date_match = re.search(r'INTERNALDATE\s+"([^"]+)"', date_response)
             if date_match:
                 date_str = date_match.group(1)
                 break
-            date_match = re.search(r'INTERNALDATE\s+([^\s]+)', date_response)
+            
+            # Pattern 2: INTERNALDATE 21-Nov-2025 13:10:45 +0000 (without quotes)
+            date_match = re.search(r'INTERNALDATE\s+([^\s)]+)', date_response)
+            if date_match:
+                date_str = date_match.group(1)
+                # If it doesn't include timezone, try to get more
+                if len(date_str) < 20:  # Short date, might need more
+                    extended_match = re.search(r'INTERNALDATE\s+([^\s)]+\s+[^\s)]+)', date_response)
+                    if extended_match:
+                        date_str = extended_match.group(1)
+                break
+            
+            # Pattern 3: (INTERNALDATE "21-Nov-2025 13:10:45 +0000")
+            date_match = re.search(r'\(INTERNALDATE\s+"([^"]+)"\)', date_response)
             if date_match:
                 date_str = date_match.group(1)
                 break
+            
+            # Pattern 4: Look for date-like patterns in the response
+            # IMAP date format: DD-MMM-YYYY HH:MM:SS +HHMM
+            date_match = re.search(r'(\d{1,2}-[A-Za-z]{3}-\d{4}\s+\d{1,2}:\d{2}:\d{2})', date_response)
+            if date_match:
+                date_str = date_match.group(1)
+                # Try to get timezone if present
+                tz_match = re.search(r'(\d{1,2}-[A-Za-z]{3}-\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[+-]\d{4})', date_response)
+                if tz_match:
+                    date_str = tz_match.group(1)
+                break
+    
     return date_str
 
 def parse_rfc822_size(data_size):
@@ -519,9 +979,11 @@ def search_messages_by_date(mail, date_since):
             print(f"Search failed with status: {status}")
             if messages and len(messages) > 0:
                 print(f"Search response: {messages}")
+            sys.stdout.flush()
             return []
     except Exception as search_err:
         print(f"Error executing IMAP search: {search_err}")
+        sys.stdout.flush()
         return []
     
     email_ids = messages[0].split() if messages and len(messages) > 0 and messages[0] else []
@@ -530,6 +992,7 @@ def search_messages_by_date(mail, date_since):
         print(f"IMAP search returned {len(email_ids)} message ID(s)")
     else:
         print("IMAP search returned 0 messages")
+    sys.stdout.flush()
     
     return email_ids
 
@@ -537,6 +1000,7 @@ def filter_messages_by_time(mail, email_ids, cutoff_time_utc, time_window_str):
     """Filters messages by INTERNALDATE to match time window"""
     print(f"\nFound {len(email_ids)} candidate messages from date search.")
     print("Filtering by actual received time...")
+    sys.stdout.flush()
     
     filtered_email_ids = []
     
@@ -576,12 +1040,14 @@ def filter_messages_by_time(mail, email_ids, cutoff_time_utc, time_window_str):
             filtered_email_ids.append(e_id)
     
     print(f"After time filtering: {len(filtered_email_ids)} messages within the {time_window_str} window.")
+    sys.stdout.flush()
     return filtered_email_ids
 
 def analyze_message_headers(mail, email_ids):
     """Analyzes message headers and returns spam candidates with metadata"""
     print(f"\nFound {len(email_ids)} candidate messages.")
     print("Analyzing headers...")
+    sys.stdout.flush()
     
     spam_candidates = []
     total_size_bytes = 0
@@ -627,8 +1093,10 @@ def analyze_message_headers(mail, email_ids):
             
             display_subject = safe_print_subject(subject, 50)
             print(f" - Identified: {display_subject}... ({int(size/1024)} KB)")
+            sys.stdout.flush()
         except Exception as e:
             print(f"Warning: Error processing message {e_id.decode()}: {e}")
+            sys.stdout.flush()
             import traceback
             traceback.print_exc()
             continue
@@ -640,6 +1108,7 @@ def download_messages(mail, spam_candidates, total_size_bytes):
     print("\n" + "="*40)
     print(f"Identified {len(spam_candidates)} emails. Total Size: {get_size_str(total_size_bytes)}.")
     print("Proceeding with download (non-interactive mode)...")
+    sys.stdout.flush()
 
     # Construct Folder Name: [Account]__YYYY-MM-DD__HHMMSS__Count__Size
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d__%H%M%S")
@@ -657,6 +1126,7 @@ def download_messages(mail, spam_candidates, total_size_bytes):
         
     print(f"\nCreated Directory: {download_path}")
     print("Downloading messages...")
+    sys.stdout.flush()
     
     downloaded_files = []
     timestamps = []
@@ -695,11 +1165,14 @@ def download_messages(mail, spam_candidates, total_size_bytes):
                     f.write(raw_email)
                 downloaded_files.append(filepath)
                 print(f"Saved: {filename}")
+                sys.stdout.flush()
             except Exception as file_err:
                 print(f"Error saving message {item['id'].decode()} to file: {file_err}")
+                sys.stdout.flush()
                 
         except Exception as e:
             print(f"Error downloading message {item['id'].decode()}: {e}")
+            sys.stdout.flush()
             import traceback
             traceback.print_exc()
             continue
@@ -729,13 +1202,17 @@ def _handle_imap_error(e, mail):
 def connect_imap():
     """Connects to IMAP server and logs in"""
     print(f"Connecting to {GMAIL_ACCOUNT}...")
+    sys.stdout.flush()
     mail = imaplib.IMAP4_SSL(IMAP_SERVER)
     mail.login(GMAIL_ACCOUNT, APP_PASS)
+    print("Connected successfully.")
+    sys.stdout.flush()
     return mail
 
 def list_all_folders(mail):
     """Lists all folders and identifies spam folder candidates"""
     print("Listing all available mailboxes to find spam folder...")
+    sys.stdout.flush()
     all_folder_names = []
     spam_candidate_names = []
     
@@ -744,62 +1221,150 @@ def list_all_folders(mail):
         if status == 'OK':
             for folder in folders:
                 folder_name = parse_folder_from_list_response(folder)
-                if folder_name:
+                if folder_name and folder_name != '/' and folder_name.strip():
                     all_folder_names.append(folder_name)
                     folder_upper = folder_name.upper()
                     if ('SPAM' in folder_upper or 'JUNK' in folder_upper) and 'INBOX' not in folder_upper:
                         spam_candidate_names.append(folder_name)
     except Exception as list_err:
         print(f"Warning: Could not list mailboxes: {list_err}")
+        sys.stdout.flush()
     
     if all_folder_names:
         print(f"Found {len(all_folder_names)} mailboxes")
         if spam_candidate_names:
             print(f"Spam/Junk folder candidates: {spam_candidate_names}")
+        sys.stdout.flush()
     
     return all_folder_names, spam_candidate_names
 
-def display_folder_counts(mail, all_folder_names):
-    """Displays message counts for all folders"""
+def display_folder_counts(mail, all_folder_names, is_first_run=False):
+    """Displays message counts and most recent email date for all folders
+    Reports in real-time for each folder before moving to the next.
+    Aborts if folder names, messages, or most recent email cannot be found (where messages > 0).
+    """
     if not all_folder_names:
+        if is_first_run:
+            print("\n" + "="*70)
+            print("FIRST RUN FAILED: Could not retrieve folder names")
+            print("="*70)
+            print("The script is aborting to commandline as this is the first run.")
+            print("Please verify your Gmail account settings and IMAP access.")
+            print("="*70)
+            sys.stdout.flush()
+            cleanup_logging()
+            sys.exit(1)
         return
     
     print("\n" + "="*70)
     print("FOLDER MESSAGE COUNTS")
     print("="*70)
-    print("Getting message counts for all folders...")
+    print("Getting message counts and most recent email dates for all folders...")
     print()
+    sys.stdout.flush()
     
     folder_counts = []
     for folder_name in all_folder_names:
         # Skip INBOX for security
-        if folder_name.upper() == 'INBOX':
+        if not folder_name or folder_name.upper() == 'INBOX' or folder_name == '/':
             continue
         
+        print(f"Checking {folder_name}...")
+        sys.stdout.flush()
+        
         msg_count = get_message_count(mail, folder_name)
-        folder_counts.append((folder_name, msg_count))
+        
+        # Abort if we can't get message count and it's first run
+        if msg_count is None and is_first_run:
+            print(f"\n" + "="*70)
+            print(f"FIRST RUN FAILED: Could not retrieve message count for folder '{folder_name}'")
+            print("="*70)
+            print("The script is aborting to commandline as this is the first run.")
+            print("Please verify your Gmail account settings and IMAP access.")
+            print("="*70)
+            sys.stdout.flush()
+            cleanup_logging()
+            sys.exit(1)
+        
+        most_recent_date = None
+        most_recent_subject = None
+        
+        # Always try to get the most recent date and subject if we have messages
+        if msg_count is not None and msg_count > 0:
+            most_recent_date, most_recent_subject = get_most_recent_email_info(mail, folder_name)
+            
+            # Abort if we can't get most recent email info and there are messages
+            if most_recent_date is None and is_first_run:
+                print(f"\n" + "="*70)
+                print(f"FIRST RUN FAILED: Could not retrieve most recent email for folder '{folder_name}'")
+                print(f"Folder has {msg_count} messages but most recent email info could not be retrieved.")
+                print("="*70)
+                print("The script is aborting to commandline as this is the first run.")
+                print("Please verify your Gmail account settings and IMAP access.")
+                print("="*70)
+                sys.stdout.flush()
+                cleanup_logging()
+                sys.exit(1)
+        
+        folder_counts.append((folder_name, msg_count, most_recent_date, most_recent_subject))
+        
+        # Report immediately for this folder
+        count_str = f"{msg_count:>10,}" if msg_count is not None else "N/A".rjust(10)
+        date_str = "N/A"
+        subject_str = "N/A"
+        if most_recent_date:
+            try:
+                date_str = most_recent_date.strftime('%Y-%m-%d %H:%M:%S')
+            except Exception:
+                date_str = "N/A"
+        if most_recent_subject:
+            subject_str = safe_print_subject(most_recent_subject, 50)
+        
+        print(f"  Messages: {count_str}")
+        print(f"  Most Recent: {date_str}")
+        print(f"  Subject: {subject_str}")
+        print()
+        sys.stdout.flush()
     
     # Sort by message count (descending)
     folder_counts.sort(key=lambda x: (x[1] is None, x[1] if x[1] is not None else 0), reverse=True)
     
-    # Display the counts
-    print(f"{'Folder Name':<40} {'Messages':>10}")
-    print("-" * 70)
+    # Display summary table
+    print(f"{'Folder Name':<40} {'Messages':>10} {'Most Recent Email':>20} {'Subject':>30}")
+    print("-" * 100)
+    sys.stdout.flush()
     total_messages = 0
     folders_with_counts = 0
-    for folder_name, count in folder_counts:
+    for folder_name, count, recent_date, recent_subject in folder_counts:
+        # Format message count
+        count_str = f"{count:>10,}" if count is not None else "N/A".rjust(10)
+        
+        # Format date - always try to show it if available
+        date_str = "N/A"
+        if recent_date:
+            try:
+                date_str = recent_date.strftime('%Y-%m-%d %H:%M')
+            except Exception:
+                date_str = "N/A"
+        
+        # Format subject
+        subject_str = "N/A"
+        if recent_subject:
+            subject_str = safe_print_subject(recent_subject, 30)
+        
+        print(f"{folder_name:<40} {count_str} {date_str:>20} {subject_str:>30}")
+        
         if count is not None:
-            print(f"{folder_name:<40} {count:>10,}")
             total_messages += count
             folders_with_counts += 1
-        else:
-            print(f"{folder_name:<40} {'N/A':>10}")
-    print("-" * 70)
+        sys.stdout.flush()
+    print("-" * 100)
     if folders_with_counts > 0:
         print(f"{'TOTAL (countable folders)':<40} {total_messages:>10,}")
     print(f"{'Folders with message counts':<40} {folders_with_counts:>10}")
     print("="*70)
     print()
+    sys.stdout.flush()
 
 def find_and_select_spam_folder(mail, spam_candidate_names):
     """Finds and selects the spam folder, with security checks"""
@@ -815,13 +1380,16 @@ def find_and_select_spam_folder(mail, spam_candidate_names):
         if name not in spam_folders:
             spam_folders.append(name)
     
-    selected_folder = None
+    print("Attempting to select spam folder...")
+    sys.stdout.flush()
+    
+    # First pass: Check all folders and get message counts
+    folder_candidates = []  # List of (folder_name, msg_count, can_select)
     
     for folder_name in spam_folders:
         # Safety check: never allow INBOX
         if is_forbidden_folder(folder_name):
-            print(f"SECURITY ERROR: Attempted to access forbidden folder: {folder_name}")
-            raise imaplib.IMAP4.error(f"SECURITY VIOLATION: Cannot access {folder_name}. Only spam folders are allowed.")
+            continue
         
         try:
             status, data = mail.select(folder_name, readonly=True)
@@ -829,17 +1397,13 @@ def find_and_select_spam_folder(mail, spam_candidate_names):
                 # Verify we did NOT select INBOX
                 normalized_name = normalize_folder_name(folder_name)
                 if normalized_name == 'INBOX' or normalized_name.endswith('/INBOX') or normalized_name.startswith('INBOX/'):
-                    print(f"SECURITY ERROR: Selected forbidden folder: {folder_name}")
                     mail.close()
-                    raise imaplib.IMAP4.error(f"SECURITY VIOLATION: Cannot access {folder_name}. Only spam/junk folders are allowed.")
+                    continue
                 
                 # Verify folder name contains SPAM or JUNK
                 if not is_spam_folder(folder_name):
-                    print(f"SECURITY ERROR: Selected folder '{folder_name}' does not contain 'SPAM' or 'JUNK'!")
                     mail.close()
-                    raise imaplib.IMAP4.error(f"SECURITY VIOLATION: Folder '{folder_name}' is not a spam/junk folder. Access denied.")
-                
-                selected_folder = folder_name
+                    continue
                 
                 # Get message count
                 msg_count = 0
@@ -849,26 +1413,59 @@ def find_and_select_spam_folder(mail, spam_candidate_names):
                         count_match = re.search(r'MESSAGES\s+(\d+)', str(message_count[0]))
                         if count_match:
                             msg_count = int(count_match.group(1))
-                            print(f"Successfully selected SPAM/JUNK mailbox: {folder_name} ({msg_count} messages)")
-                        else:
-                            print(f"Successfully selected SPAM/JUNK mailbox: {folder_name}")
-                    else:
-                        print(f"Successfully selected SPAM/JUNK mailbox: {folder_name}")
-                except Exception as status_err:
-                    print(f"Successfully selected SPAM/JUNK mailbox: {folder_name} (could not get message count: {status_err})")
+                except Exception:
+                    pass
+                
+                folder_candidates.append((folder_name, msg_count, True))
+                mail.close()
+            else:
+                folder_candidates.append((folder_name, 0, False))
+        except imaplib.IMAP4.error as select_err:
+            if 'INBOX' in str(select_err).upper() or is_forbidden_folder(folder_name):
+                continue
+            folder_candidates.append((folder_name, 0, False))
+            continue
+        except Exception:
+            folder_candidates.append((folder_name, 0, False))
+            continue
+    
+    # Sort candidates: prefer folders with messages, then by message count (descending)
+    folder_candidates.sort(key=lambda x: (not x[2], x[1] == 0, -x[1]))
+    
+    # Select the best candidate (first one that can be selected, preferably with messages)
+    selected_folder = None
+    msg_count = 0
+    
+    for folder_name, count, can_select in folder_candidates:
+        if not can_select:
+            continue
+        
+        try:
+            status, data = mail.select(folder_name, readonly=True)
+            if status == 'OK':
+                # Final security checks
+                normalized_name = normalize_folder_name(folder_name)
+                if normalized_name == 'INBOX' or normalized_name.endswith('/INBOX') or normalized_name.startswith('INBOX/'):
+                    mail.close()
+                    continue
+                
+                if not is_spam_folder(folder_name):
+                    mail.close()
+                    continue
+                
+                selected_folder = folder_name
+                msg_count = count
+                
+                print(f"Successfully selected SPAM/JUNK mailbox: {folder_name} ({msg_count} messages)")
+                sys.stdout.flush()
                 
                 if msg_count == 0:
                     print(f"WARNING: Selected folder '{folder_name}' has 0 messages. This might not be the correct spam folder.")
                     print("If you know there is spam, please check the folder list above and verify the correct folder name.")
+                    sys.stdout.flush()
                 
                 break
-            else:
-                print(f"Failed to select '{folder_name}': status={status}")
-        except imaplib.IMAP4.error as select_err:
-            if 'INBOX' in str(select_err).upper() or is_forbidden_folder(folder_name):
-                print(f"SECURITY ERROR: Attempted to access forbidden folder: {folder_name}")
-                raise imaplib.IMAP4.error(f"SECURITY VIOLATION: Cannot access {folder_name}. Only spam folders are allowed.")
-            print(f"Error selecting '{folder_name}': {select_err}")
+        except Exception:
             continue
     
     if not selected_folder:
@@ -944,9 +1541,10 @@ def _print_folder_selection_error(mail):
     
     print("=" * 70)
 
-def process_spam_iteration():
+def process_spam_iteration(is_first_run=False):
     """Processes one iteration of spam download and forwarding"""
     print("--- STARTING SPAM PROCESSOR ITERATION ---")
+    sys.stdout.flush()
     
     mail = None
     spam_candidates = []
@@ -957,12 +1555,41 @@ def process_spam_iteration():
     # ---------------------------------------------------------
     try:
         mail = connect_imap()
+        sys.stdout.flush()
         
         all_folder_names, spam_candidate_names = list_all_folders(mail)
+        sys.stdout.flush()
+        
+        # On first run, abort if folder listing failed or returned empty
+        if is_first_run:
+            if not all_folder_names:
+                print("\n" + "="*70)
+                print("FIRST RUN FAILED: Could not retrieve folder names")
+                print("="*70)
+                print("The script is aborting to commandline as this is the first run.")
+                print("Please verify your Gmail account settings and IMAP access.")
+                print("="*70)
+                safe_logout(mail)
+                cleanup_logging()
+                sys.exit(1)
+        
         if all_folder_names:
-            display_folder_counts(mail, all_folder_names)
+            display_folder_counts(mail, all_folder_names, is_first_run=is_first_run)
+            sys.stdout.flush()
+        elif is_first_run:
+            # On first run, abort if we couldn't display folder counts
+            print("\n" + "="*70)
+            print("FIRST RUN FAILED: Could not retrieve folder counts")
+            print("="*70)
+            print("The script is aborting to commandline as this is the first run.")
+            print("Please verify your Gmail account settings and IMAP access.")
+            print("="*70)
+            safe_logout(mail)
+            cleanup_logging()
+            sys.exit(1)
         
         selected_folder = find_and_select_spam_folder(mail, spam_candidate_names)
+        sys.stdout.flush()
         
         # Calculate time window and search dates
         now, cutoff_time, cutoff_time_utc, date_since = calculate_cutoff_times(SPAM_SEARCH_WINDOW_HOURS)
@@ -971,38 +1598,48 @@ def process_spam_iteration():
         print(f"Searching for spam received since {date_since} (past {time_window_str})...")
         print(f"Current time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Search window start: {cutoff_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        sys.stdout.flush()
         
         # Search for messages
         email_ids = search_messages_by_date(mail, date_since)
+        sys.stdout.flush()
         if not email_ids:
             print(f"No spam found in the past {time_window_str}.")
+            sys.stdout.flush()
             safe_logout(mail)
             return
         
         # Filter by INTERNALDATE
         email_ids = filter_messages_by_time(mail, email_ids, cutoff_time_utc, time_window_str)
+        sys.stdout.flush()
         if not email_ids:
             print(f"No spam found in the past {time_window_str}.")
+            sys.stdout.flush()
             safe_logout(mail)
             return
 
         # Analyze headers
         spam_candidates, total_size_bytes = analyze_message_headers(mail, email_ids)
+        sys.stdout.flush()
     
     except imaplib.IMAP4.error as e:
         # If we failed to find spam folders, re-raise so run_spam_processor can handle first-run abort
         if "Failed to select spam mailbox" in str(e) or "spam mailbox" in str(e).lower():
             safe_logout(mail)
+            sys.stdout.flush()
             raise  # Re-raise so run_spam_processor can check if it's first run
         _handle_imap_error(e, mail)
+        sys.stdout.flush()
         return
     except Exception as e:
         error_str = str(e).lower()
         # If error is about spam folder detection, re-raise for first-run handling
         if "spam" in error_str and ("folder" in error_str or "mailbox" in error_str):
             safe_logout(mail)
+            sys.stdout.flush()
             raise  # Re-raise so run_spam_processor can check if it's first run
         print(f"Error during connection/search: {e}")
+        sys.stdout.flush()
         safe_logout(mail)
         return
 
@@ -1011,10 +1648,12 @@ def process_spam_iteration():
     # ---------------------------------------------------------
     if not spam_candidates:
         print("No spam candidates to download.")
+        sys.stdout.flush()
         safe_logout(mail)
         return
     
     downloaded_files, timestamps = download_messages(mail, spam_candidates, total_size_bytes)
+    sys.stdout.flush()
     
     # Close IMAP connection
     mail.close()
@@ -1024,16 +1663,20 @@ def process_spam_iteration():
     # PHASE 4: REPORT STATISTICS
     # ---------------------------------------------------------
     print_statistics(downloaded_files, total_size_bytes, timestamps)
+    sys.stdout.flush()
     
     # ---------------------------------------------------------
     # PHASE 5: FORWARD TO SPAMCOP (With first-run confirmation)
     # ---------------------------------------------------------
     if len(downloaded_files) > 0:
         forward_to_spamcop(downloaded_files, spam_candidates, total_size_bytes)
+        sys.stdout.flush()
     else:
         print("\nSkipping send. Files remain in your local folder.")
+        sys.stdout.flush()
 
     print("\n--- ITERATION COMPLETE ---")
+    sys.stdout.flush()
 
 def print_statistics(downloaded_files, total_size_bytes, timestamps):
     """Prints download statistics"""
@@ -1043,6 +1686,7 @@ def print_statistics(downloaded_files, total_size_bytes, timestamps):
     print(f"Source Folder:     [Gmail]/Spam (READ-ONLY ACCESS)")
     print(f"Total Emails:      {len(downloaded_files)}")
     print(f"Total Size:        {get_size_str(total_size_bytes)}")
+    sys.stdout.flush()
     
     if timestamps:
         timestamps.sort()
@@ -1054,6 +1698,7 @@ def print_statistics(downloaded_files, total_size_bytes, timestamps):
         print(f"Time Span:         {span}")
     else:
         print("Time Span:         Could not calculate (invalid date headers)")
+    sys.stdout.flush()
 
 def forward_to_spamcop(downloaded_files, spam_candidates, total_size_bytes):
     """Handles forwarding emails to SpamCop with first-run confirmation"""
@@ -1070,9 +1715,11 @@ def forward_to_spamcop(downloaded_files, spam_candidates, total_size_bytes):
         if SIMULATION_MODE:
             print("\n" + "-"*40)
             print(f"SIMULATION MODE: Would bundle {len(downloaded_files)} files and send to SpamCop...")
+            sys.stdout.flush()
         else:
             print("\n" + "-"*40)
             print(f"Bundling {len(downloaded_files)} files and sending to SpamCop...")
+            sys.stdout.flush()
     
     # Check simulation mode
     if SIMULATION_MODE:
@@ -1099,12 +1746,14 @@ def _handle_first_run_confirmation(first_run_flag_file, downloaded_files, spam_c
     print(f"Download location: {download_path}")
     print("\nEmail subjects (please verify these match your Gmail Spam folder):")
     print()
+    sys.stdout.flush()
     
     for idx, item in enumerate(spam_candidates, 1):
         display_subject = safe_print_subject(item['subject'], 60)
         print(f"  {idx}. {display_subject}")
         if item['date']:
             print(f"     Date: {item['date']}")
+        sys.stdout.flush()
     
     print("\n" + "="*70)
     print("VERIFICATION STEPS:")
@@ -1112,16 +1761,19 @@ def _handle_first_run_confirmation(first_run_flag_file, downloaded_files, spam_c
     print(msg.FIRST_RUN_VERIFICATION_STEPS)  # type: ignore
     print("="*70)
     print()
+    sys.stdout.flush()
     
     while True:
         response = input("Have you verified that ALL downloaded emails are spam? (yes/no): ").strip().lower()
         if response in ['yes', 'y']:
             print("\n✓ Confirmation received. Proceeding with forwarding to SpamCop...")
+            sys.stdout.flush()
             try:
                 with open(first_run_flag_file, 'w') as f:
                     f.write(f"First run completed: {datetime.datetime.now().isoformat()}\n")
             except Exception as e:
                 print(f"Warning: Could not create first-run flag file: {e}")
+                sys.stdout.flush()
             return True
         elif response in ['no', 'n']:
             print("\n" + "="*70)
@@ -1130,9 +1782,11 @@ def _handle_first_run_confirmation(first_run_flag_file, downloaded_files, spam_c
             print(msg.FIRST_RUN_CANCELLED.format(download_path=download_path))  # type: ignore
             print("="*70)
             print("\n--- ITERATION COMPLETE (NO EMAILS FORWARDED) ---")
+            sys.stdout.flush()
             return False
         else:
             print("Please enter 'yes' or 'no'.")
+            sys.stdout.flush()
 
 def _print_simulation_mode_info(downloaded_files):
     """Prints simulation mode information"""
@@ -1145,18 +1799,22 @@ def _print_simulation_mode_info(downloaded_files):
     print(f"  Subject: Spam Report: {len(downloaded_files)} messages")
     print(f"  Attachments: {len(downloaded_files)} EML files")
     print()
+    sys.stdout.flush()
     for filepath in downloaded_files:
         filename = os.path.basename(filepath)
         file_size = os.path.getsize(filepath)
         print(f"    - {filename} ({get_size_str(file_size)})")
+        sys.stdout.flush()
     print()
     print("All steps completed successfully (connect, search, download, save).")
     print("Set SIMULATION_MODE = False in config.py to enable actual forwarding.")
     print("="*70)
+    sys.stdout.flush()
 
 def _send_to_spamcop(downloaded_files):
     """Sends emails to SpamCop via SMTP"""
     print(f"\nConnecting to Gmail SMTP ({SMTP_SERVER})...")
+    sys.stdout.flush()
     try:
         # Construct the Email
         msg = MIMEMultipart()
@@ -1166,6 +1824,7 @@ def _send_to_spamcop(downloaded_files):
         
         # Attach files
         print("Attaching files...")
+        sys.stdout.flush()
         for filepath in downloaded_files:
             filename = os.path.basename(filepath)
             with open(filepath, 'rb') as f:
@@ -1177,6 +1836,7 @@ def _send_to_spamcop(downloaded_files):
         
         # Send using Gmail SMTP
         print("Sending data...")
+        sys.stdout.flush()
         server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
         server.starttls()
         server.login(GMAIL_ACCOUNT, APP_PASS)
@@ -1184,10 +1844,12 @@ def _send_to_spamcop(downloaded_files):
         server.quit()
         
         print("\nSUCCESS: Report sent to SpamCop.")
+        sys.stdout.flush()
         
     except Exception as e:
         print(f"\nFAILED to send email: {e}")
         print("The files are still safe in your local folder.")
+        sys.stdout.flush()
         import traceback
         traceback.print_exc()
 
@@ -1202,8 +1864,10 @@ def run_spam_processor():
         try:
             os.remove(initial_flag_path)
             print(f"Deleted initial flag file: {initial_flag_path}")
+            sys.stdout.flush()
         except Exception as e:
             print(f"Warning: Could not delete initial flag file: {e}")
+            sys.stdout.flush()
     
     # Validate configuration
     try:
@@ -1215,6 +1879,7 @@ def run_spam_processor():
             print("Please fix LOOP_FREQUENCY_HOURS in the configuration section.")
         elif "SPAM_SEARCH_WINDOW_HOURS" in str(e):
             print("Please fix SPAM_SEARCH_WINDOW_HOURS in the configuration section.")
+        sys.stdout.flush()
         return
     
     # Format display strings
@@ -1243,12 +1908,15 @@ def run_spam_processor():
     else:
         print("SIMULATION MODE: DISABLED - Emails WILL be forwarded to SpamCop")
     print("="*60)
+    sys.stdout.flush()
     
     if is_first_run:
         print("FIRST RUN DETECTED - Will abort if spam folders are not found")
         print("="*60)
+        sys.stdout.flush()
     
     print("Starting first iteration immediately...\n")
+    sys.stdout.flush()
     
     iteration_count = 0
     last_run_time = None
@@ -1268,9 +1936,10 @@ def run_spam_processor():
         else:
             print("Last run: (First iteration)")
         print(f"{'='*60}\n")
+        sys.stdout.flush()
         
         try:
-            process_spam_iteration()
+            process_spam_iteration(is_first_run=is_first_run)
             
             # After successful first run, create the initial flag file
             if is_first_run:
@@ -1278,12 +1947,16 @@ def run_spam_processor():
                     with open(initial_flag_path, 'w') as f:
                         f.write(f"Initial setup completed: {datetime.datetime.now().isoformat()}\n")
                     print(f"\n✓ Initial setup completed successfully. Flag file created: {initial_flag_path}")
+                    sys.stdout.flush()
                     is_first_run = False  # No longer first run
                 except Exception as e:
                     print(f"Warning: Could not create initial flag file: {e}")
+                    sys.stdout.flush()
                     
         except KeyboardInterrupt:
             print("\n\nReceived interrupt signal. Shutting down gracefully...")
+            sys.stdout.flush()
+            cleanup_logging()
             break
         except imaplib.IMAP4.error as e:
             # If it's the first run and we couldn't find spam folders, abort to commandline
@@ -1294,10 +1967,13 @@ def run_spam_processor():
                 print("The script is aborting to commandline as this is the first run.")
                 print("Please verify your Gmail account settings and spam folder configuration.")
                 print("="*70)
+                sys.stdout.flush()
+                cleanup_logging()
                 sys.exit(1)
             else:
                 print(f"\nERROR in iteration #{iteration_count}: {e}")
                 print("Continuing to next iteration...")
+                sys.stdout.flush()
                 import traceback
                 traceback.print_exc()
         except Exception as e:
@@ -1311,12 +1987,15 @@ def run_spam_processor():
                 print("The script is aborting to commandline as this is the first run.")
                 print("Please verify your Gmail account settings and spam folder configuration.")
                 print("="*70)
+                sys.stdout.flush()
                 import traceback
                 traceback.print_exc()
+                cleanup_logging()
                 sys.exit(1)
             else:
                 print(f"\nERROR in iteration #{iteration_count}: {e}")
                 print("Continuing to next iteration...")
+                sys.stdout.flush()
                 import traceback
                 traceback.print_exc()
         
@@ -1369,6 +2048,7 @@ def run_spam_processor():
             console.print("[green]Countdown complete! Starting next iteration...\n")
         except KeyboardInterrupt:
             console.print("\n[yellow]Received interrupt signal during sleep. Shutting down gracefully...")
+            cleanup_logging()
             break
 
 if __name__ == "__main__":
