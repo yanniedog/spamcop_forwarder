@@ -12,7 +12,7 @@ import traceback
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
-from email.utils import parsedate_to_datetime
+from email.utils import parsedate_to_datetime, parseaddr
 from email.header import decode_header
 
 # Third-party imports
@@ -297,6 +297,34 @@ PREVIEW_ALL_FOLDERS = False  # Set to True to enable folder preview
 #    The name of the spam folder to use when PREVIEW_ALL_FOLDERS is False
 #    Default: '[Google Mail]/Spam' (standard Gmail spam folder)
 SPAM_FOLDER_NAME = '[Google Mail]/Spam'  # Spam folder name (use exact IMAP folder name)
+
+# 10. EXCLUSION LISTS
+#    Emails matching these criteria will NOT be sent to SpamCop
+#    EXCLUDED_SENDERS: List of email addresses or domains to exclude (case-insensitive)
+#    EXCLUDED_SUBJECT_KEYWORDS: List of keywords/phrases in subject lines and body to exclude (case-insensitive)
+#      - Supports both single keywords and multi-word phrases
+#      - Keywords/phrases are searched in BOTH subject line AND email body
+#      - Cannot conflict with FORCE_INCLUDE_KEYWORDS (script will error if conflicts detected)
+#    Examples:
+#    EXCLUDED_SENDERS = ['noreply@example.com', '@newsletters.com']  # Exclude specific senders or domains
+#    EXCLUDED_SUBJECT_KEYWORDS = ['newsletter', 'unsubscribe', 'marketing update', 'policy change']  # Exclude emails with these keywords/phrases
+EXCLUDED_SENDERS = []  # List of email addresses or domains (e.g., ['sender@example.com', '@domain.com'])
+EXCLUDED_SUBJECT_KEYWORDS = []  # List of keywords/phrases (e.g., ['newsletter', 'unsubscribe', 'marketing update'])
+
+# 11. FORCE INCLUDE KEYWORDS
+#    Emails matching these keywords in subject or body will ALWAYS be sent to SpamCop
+#    This overrides exclusion rules - if an email matches force-include keywords, it will be sent
+#    even if it would normally be excluded
+#    FORCE_INCLUDE_KEYWORDS: List of keywords/phrases to force include (case-insensitive)
+#      - Supports both single keywords and multi-word phrases
+#      - Keywords/phrases are searched ONLY in subject line and email body (NOT in sender email address)
+#      - This prevents false matches when keywords appear in your own email address
+#      - Any email with subject or body containing these keywords/phrases will be force-included
+#      - This takes priority over exclusion rules
+#      - Cannot conflict with EXCLUDED_SUBJECT_KEYWORDS (script will error if conflicts detected)
+#    Examples:
+#    FORCE_INCLUDE_KEYWORDS = ['phishing', 'scam', 'bitcoin', 'cryptocurrency', 'nigerian prince']
+FORCE_INCLUDE_KEYWORDS = []  # List of keywords/phrases (e.g., ['phishing', 'scam', 'bitcoin'])
 '''
         with open(config_path, 'w', encoding='utf-8') as f:
             f.write(config_content)
@@ -343,7 +371,10 @@ SPAM_FOLDER_NAME = '[Google Mail]/Spam'  # Spam folder name (use exact IMAP fold
             'SPAM_SEARCH_WINDOW_HOURS': getattr(config, 'SPAM_SEARCH_WINDOW_HOURS', config.LOOP_FREQUENCY_HOURS),
             'SIMULATION_MODE': getattr(config, 'SIMULATION_MODE', True),
             'PREVIEW_ALL_FOLDERS': getattr(config, 'PREVIEW_ALL_FOLDERS', False),
-            'SPAM_FOLDER_NAME': getattr(config, 'SPAM_FOLDER_NAME', '[Google Mail]/Spam')
+            'SPAM_FOLDER_NAME': getattr(config, 'SPAM_FOLDER_NAME', '[Google Mail]/Spam'),
+            'EXCLUDED_SENDERS': getattr(config, 'EXCLUDED_SENDERS', []),
+            'EXCLUDED_SUBJECT_KEYWORDS': getattr(config, 'EXCLUDED_SUBJECT_KEYWORDS', []),
+            'FORCE_INCLUDE_KEYWORDS': getattr(config, 'FORCE_INCLUDE_KEYWORDS', [])
         }
     except Exception as e:
         print(f"Error loading configuration: {e}")
@@ -382,6 +413,46 @@ def print_config_instructions(missing_fields):
     print("4. Run this script again")
     print("=" * 70 + "\n")
 
+def validate_keyword_conflicts():
+    """Validates that there are no conflicts between exclusion and force-include keywords.
+    Raises ValueError if conflicts are found.
+    """
+    conflicts = []
+    
+    # Normalize all keywords for comparison (lowercase, strip)
+    excluded_keywords = [kw.lower().strip() for kw in EXCLUDED_SUBJECT_KEYWORDS if kw and kw.strip()]
+    force_include_keywords = [kw.lower().strip() for kw in FORCE_INCLUDE_KEYWORDS if kw and kw.strip()]
+    
+    # Check for exact matches
+    for excluded in excluded_keywords:
+        if excluded in force_include_keywords:
+            conflicts.append(f"Exact match: '{excluded}' appears in both EXCLUDED_SUBJECT_KEYWORDS and FORCE_INCLUDE_KEYWORDS")
+    
+    # Check for substring matches (one keyword contains another)
+    for excluded in excluded_keywords:
+        for force_include in force_include_keywords:
+            # Check if excluded keyword is contained in force-include keyword
+            if excluded in force_include and excluded != force_include:
+                conflicts.append(f"Substring match: EXCLUDED keyword '{excluded}' is contained in FORCE_INCLUDE keyword '{force_include}'")
+            # Check if force-include keyword is contained in excluded keyword
+            elif force_include in excluded and excluded != force_include:
+                conflicts.append(f"Substring match: FORCE_INCLUDE keyword '{force_include}' is contained in EXCLUDED keyword '{excluded}'")
+    
+    if conflicts:
+        error_msg = "\n" + "=" * 70 + "\n"
+        error_msg += "CONFIGURATION CONFLICT ERROR\n"
+        error_msg += "=" * 70 + "\n"
+        error_msg += "Conflicts detected between EXCLUDED_SUBJECT_KEYWORDS and FORCE_INCLUDE_KEYWORDS:\n\n"
+        for i, conflict in enumerate(conflicts, 1):
+            error_msg += f"  {i}. {conflict}\n"
+        error_msg += "\n"
+        error_msg += "Please resolve these conflicts by removing or modifying the conflicting keywords.\n"
+        error_msg += "A keyword cannot be both excluded and force-included.\n"
+        error_msg += "=" * 70 + "\n"
+        raise ValueError(error_msg)
+    
+    return True
+
 # Load configuration
 config = load_config()
 GMAIL_ACCOUNT = config['GMAIL_ACCOUNT']
@@ -395,6 +466,18 @@ SPAM_SEARCH_WINDOW_HOURS = config['SPAM_SEARCH_WINDOW_HOURS']
 SIMULATION_MODE = config['SIMULATION_MODE']
 PREVIEW_ALL_FOLDERS = config['PREVIEW_ALL_FOLDERS']
 SPAM_FOLDER_NAME = config['SPAM_FOLDER_NAME']
+EXCLUDED_SENDERS = config['EXCLUDED_SENDERS']
+EXCLUDED_SUBJECT_KEYWORDS = config['EXCLUDED_SUBJECT_KEYWORDS']
+FORCE_INCLUDE_KEYWORDS = config['FORCE_INCLUDE_KEYWORDS']
+
+# Validate keyword conflicts
+try:
+    validate_keyword_conflicts()
+except ValueError as e:
+    print(str(e))
+    sys.stdout.flush()
+    cleanup_logging()
+    sys.exit(1)
 
 # Convert BASE_DIRECTORY to absolute path if it's relative
 if not os.path.isabs(BASE_DIRECTORY):
@@ -1049,6 +1132,148 @@ def filter_messages_by_time(mail, email_uids, cutoff_time_utc, time_window_str):
     sys.stdout.flush()
     return filtered_email_uids
 
+def extract_sender_from_header(msg_header):
+    """Extracts sender email address from email header"""
+    from_header = msg_header.get('From', '')
+    if not from_header:
+        return ''
+    
+    # Decode the From header
+    from_decoded = decode_email_header(from_header)
+    
+    # Try to extract email address from "Name <email@domain.com>" or just "email@domain.com"
+    # Use email.utils.parseaddr to handle various formats
+    name, email_addr = parseaddr(from_decoded)
+    
+    # If parseaddr didn't find an email, try regex
+    if not email_addr:
+        email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', from_decoded)
+        if email_match:
+            email_addr = email_match.group(0)
+    
+    return email_addr.lower() if email_addr else ''
+
+def is_email_excluded(sender, subject, body_text=""):
+    """Checks if an email should be excluded based on sender, subject, or body keywords/phrases.
+    
+    Supports both single keywords and multi-word phrases.
+    """
+    sender_lower = sender.lower()
+    subject_lower = subject.lower()
+    body_lower = body_text.lower() if body_text else ""
+    
+    # Check excluded senders
+    for excluded in EXCLUDED_SENDERS:
+        excluded_lower = excluded.lower().strip()
+        if not excluded_lower:
+            continue
+        
+        # Extract domain from sender email (everything after @)
+        sender_domain = ''
+        if '@' in sender_lower:
+            sender_domain = sender_lower.split('@', 1)[1]
+        
+        # Check if it's a domain exclusion (starts with @)
+        if excluded_lower.startswith('@'):
+            # Remove the @ for comparison
+            excluded_domain = excluded_lower[1:]
+            # Check if sender domain ends with the excluded domain (for partial domain matching)
+            # e.g., @.gov.au matches ths.tas.gov.au
+            if sender_domain and (sender_domain == excluded_domain or sender_domain.endswith('.' + excluded_domain)):
+                return True, f"sender domain matches '{excluded}'"
+            # Also check if excluded string is in full sender (for backwards compatibility)
+            if excluded_lower in sender_lower:
+                return True, f"sender domain matches '{excluded}'"
+        # Check if it's a partial domain (starts with .) - matches domains ending with it
+        elif excluded_lower.startswith('.'):
+            if sender_domain and sender_domain.endswith(excluded_lower):
+                return True, f"sender domain ends with '{excluded}'"
+        # Check if it's an exact email match
+        elif excluded_lower == sender_lower:
+            return True, f"sender matches '{excluded}'"
+        # Check if sender contains the excluded string (for partial matches)
+        elif excluded_lower in sender_lower:
+            return True, f"sender contains '{excluded}'"
+    
+    # Check excluded subject/body keywords/phrases (supports multi-word phrases)
+    for keyword in EXCLUDED_SUBJECT_KEYWORDS:
+        keyword_lower = keyword.lower().strip()
+        if not keyword_lower:
+            continue
+        
+        # Check subject
+        if keyword_lower in subject_lower:
+            return True, f"subject contains keyword/phrase '{keyword}'"
+        
+        # Check body
+        if body_lower and keyword_lower in body_lower:
+            return True, f"body contains keyword/phrase '{keyword}'"
+    
+    return False, None
+
+def extract_body_text(raw_email_bytes):
+    """Extracts plain text from email body for keyword searching"""
+    try:
+        msg = email.message_from_bytes(raw_email_bytes)
+        body_text = ""
+        
+        # Try to get plain text body
+        if msg.is_multipart():
+            for part in msg.walk():
+                content_type = part.get_content_type()
+                if content_type == 'text/plain':
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        try:
+                            # Try to decode with charset from part
+                            charset = part.get_content_charset() or 'utf-8'
+                            body_text += payload.decode(charset, errors='ignore')
+                        except:
+                            # Fallback to utf-8
+                            body_text += payload.decode('utf-8', errors='ignore')
+        else:
+            # Single part message
+            payload = msg.get_payload(decode=True)
+            if payload:
+                try:
+                    charset = msg.get_content_charset() or 'utf-8'
+                    body_text = payload.decode(charset, errors='ignore')
+                except:
+                    body_text = payload.decode('utf-8', errors='ignore')
+        
+        return body_text.lower()
+    except Exception:
+        return ""
+
+def is_email_force_included(subject, body_text):
+    """Checks if an email should be force-included based on keywords in subject or body.
+    
+    NOTE: This function intentionally does NOT check the sender email address.
+    Keywords are only matched against the subject line and email body text.
+    This prevents false matches when keywords appear in the sender's email address
+    (e.g., keyword 'jkokavec' should not match sender 'jkokavec@gmail.com').
+    """
+    if not FORCE_INCLUDE_KEYWORDS:
+        return False, None
+    
+    subject_lower = subject.lower()
+    body_lower = body_text.lower() if body_text else ""
+    
+    for keyword in FORCE_INCLUDE_KEYWORDS:
+        keyword_lower = keyword.lower().strip()
+        if not keyword_lower:
+            continue
+        
+        # Check subject only (NOT sender address) - supports phrases
+        if keyword_lower in subject_lower:
+            return True, f"subject contains force-include keyword/phrase '{keyword}'"
+        
+        # Check body only (NOT sender address) - supports phrases
+        if body_lower and keyword_lower in body_lower:
+            return True, f"body contains force-include keyword/phrase '{keyword}'"
+    
+    return False, None
+
 def analyze_message_headers(mail, email_uids):
     """Analyzes message headers and returns spam candidates with metadata using UID FETCH"""
     print(f"\nFound {len(email_uids)} candidate messages.")
@@ -1057,6 +1282,7 @@ def analyze_message_headers(mail, email_uids):
     
     spam_candidates = []
     total_size_bytes = 0
+    excluded_count = 0
     
     for uid in email_uids:
         try:
@@ -1084,12 +1310,45 @@ def analyze_message_headers(mail, email_uids):
                 print(f"Warning: Could not fetch header for message UID {uid_str}")
                 continue
             
-            total_size_bytes += size
-            
             msg_header = email.message_from_bytes(raw_header)
             subject_raw = msg_header['Subject']
             subject = decode_email_header(subject_raw) if subject_raw else "(No Subject)"
             date_str = msg_header['Date']
+            
+            # Extract sender
+            sender = extract_sender_from_header(msg_header)
+            
+            # Fetch body to check for keywords (needed for both exclusion and force-include)
+            body_text = ""
+            if FORCE_INCLUDE_KEYWORDS or EXCLUDED_SUBJECT_KEYWORDS:
+                try:
+                    res_body, data_body = mail.uid('FETCH', uid, '(BODY.PEEK[])')
+                    if res_body == 'OK' and data_body:
+                        raw_email = extract_raw_email(data_body)
+                        if raw_email:
+                            body_text = extract_body_text(raw_email)
+                except Exception:
+                    pass  # If body fetch fails, just use empty body
+            
+            # Check force-include keywords first (these override exclusions)
+            is_force_included, force_include_reason = is_email_force_included(subject, body_text)
+            
+            if is_force_included:
+                # Force include - always process this email regardless of exclusion rules
+                print(f" - FORCE INCLUDED: {safe_print_subject(subject, 50)}... ({force_include_reason})")
+                sys.stdout.flush()
+                # Continue processing - skip exclusion check
+            else:
+                # Check if email should be excluded (now checks both subject and body)
+                is_excluded, exclusion_reason = is_email_excluded(sender, subject, body_text)
+                if is_excluded:
+                    excluded_count += 1
+                    display_subject = safe_print_subject(subject, 50)
+                    print(f" - EXCLUDED: {display_subject}... ({exclusion_reason})")
+                    sys.stdout.flush()
+                    continue
+            
+            total_size_bytes += size
             
             # Store UID as string for easier handling
             uid_str = uid.decode() if isinstance(uid, bytes) else str(uid)
@@ -1098,6 +1357,7 @@ def analyze_message_headers(mail, email_uids):
                 'uid': uid_str,
                 'uid_bytes': uid,  # Keep bytes version for IMAP operations
                 'subject': subject,
+                'sender': sender,
                 'date': date_str,
                 'size': size
             })
@@ -1112,6 +1372,10 @@ def analyze_message_headers(mail, email_uids):
             import traceback
             traceback.print_exc()
             continue
+    
+    if excluded_count > 0:
+        print(f"\nExcluded {excluded_count} email(s) based on exclusion rules.")
+        sys.stdout.flush()
     
     return spam_candidates, total_size_bytes
 
@@ -2118,6 +2382,7 @@ def run_spam_processor():
     try:
         validate_loop_frequency(LOOP_FREQUENCY_HOURS)
         validate_search_window(SPAM_SEARCH_WINDOW_HOURS)
+        validate_keyword_conflicts()  # Re-validate in case config was changed
     except ValueError as e:
         print(f"CONFIGURATION ERROR: {e}")
         if "LOOP_FREQUENCY_HOURS" in str(e):
