@@ -4,6 +4,10 @@ config.py
 # First run confirmation flag
 .spamcop_first_run_complete
 
+# Tracking files for sent emails and spam folder cache
+.spamcop_sent_uids.txt
+.spamcop_folder_cache.txt
+
 # Python cache
 __pycache__/
 *.py[cod]
@@ -30,3 +34,4 @@ downloads/
 
 .spamcop_initial_listing_complete
 spamcop_forwarder.log
+*.eml
