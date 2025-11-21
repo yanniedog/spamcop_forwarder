@@ -28,3 +28,4 @@ Thumbs.db
 # Downloads folder (contains spam emails)
 downloads/
 
+.spamcop_initial_listing_complete

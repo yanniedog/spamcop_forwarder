@@ -24,6 +24,24 @@ import messages as msg  # type: ignore
 console = Console()
 
 # ==========================================
+#              CONSTANTS
+# ==========================================
+
+IMAP_SERVER = 'imap.gmail.com'
+FORBIDDEN_FOLDERS = ['INBOX', 'inbox', 'Inbox', '"INBOX"']
+COMMON_SPAM_FOLDER_NAMES = [
+    '[Gmail]/Spam',      # Most common Gmail format
+    '"[Gmail]/Spam"',    # Quoted version
+    '[Google Mail]/Spam', # Alternative Gmail folder name
+    'Spam',              # Simple name (some IMAP clients)
+    '[Gmail]/Junk',      # Some accounts use Junk
+    'Junk'               # Simple Junk folder name
+]
+FIRST_RUN_FLAG_FILE = '.spamcop_first_run_complete'
+INITIAL_SETUP_FLAG_FILE = '.spamcop_initial'
+DEFAULT_SIZE_KB = 1024  # Default 1KB if size can't be determined
+
+# ==========================================
 #              CONFIGURATION LOADING
 # ==========================================
 
@@ -179,6 +197,18 @@ SIMULATION_MODE = config['SIMULATION_MODE']
 if not os.path.isabs(BASE_DIRECTORY):
     BASE_DIRECTORY = os.path.join(os.path.dirname(os.path.abspath(__file__)), BASE_DIRECTORY)
 
+# Ensure base directory exists
+if not os.path.exists(BASE_DIRECTORY):
+    try:
+        os.makedirs(BASE_DIRECTORY)
+        print(f"Created base directory: {BASE_DIRECTORY}")
+    except Exception as e:
+        print(f"Warning: Could not create base directory '{BASE_DIRECTORY}': {e}")
+        print("The script may fail when trying to save downloaded emails.")
+elif not os.path.isdir(BASE_DIRECTORY):
+    print(f"Error: '{BASE_DIRECTORY}' exists but is not a directory!")
+    sys.exit(1)
+
 # ==========================================
 
 def decode_email_header(header_value):
@@ -257,6 +287,37 @@ def get_size_str(bytes_val):
     else:
         return f"{int(bytes_val / (1024 * 1024))}mb"
 
+def format_hours_as_string(hours):
+    """Converts hours to a human-readable string"""
+    if hours < 1:
+        return f"{int(hours * 60)} minutes"
+    elif hours == 1:
+        return "1 hour"
+    else:
+        return f"{int(hours)} hours"
+
+def normalize_folder_name(folder_name):
+    """Normalizes folder name for comparison (removes quotes, brackets, etc.)"""
+    return folder_name.upper().replace('"', '').replace("'", '').replace('\\', '/').replace('[', '').replace(']', '')
+
+def is_forbidden_folder(folder_name):
+    """Checks if a folder is in the forbidden list (e.g., INBOX)"""
+    normalized = normalize_folder_name(folder_name)
+    return normalized == 'INBOX' or normalized.endswith('/INBOX') or normalized.startswith('INBOX/')
+
+def is_spam_folder(folder_name):
+    """Checks if a folder name indicates it's a spam/junk folder"""
+    normalized = normalize_folder_name(folder_name)
+    return 'SPAM' in normalized or 'JUNK' in normalized
+
+def safe_logout(mail):
+    """Safely logout from IMAP connection"""
+    if mail:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+
 def validate_loop_frequency(hours):
     """Validates that loop frequency is > 0 and <= 48 hours"""
     if hours is None or hours == 0:
@@ -277,487 +338,309 @@ def validate_search_window(hours):
         raise ValueError(f"SPAM_SEARCH_WINDOW_HOURS ({hours}) cannot be negative.")
     return True
 
-def process_spam_iteration():
-    """Processes one iteration of spam download and forwarding"""
-    print("--- STARTING SPAM PROCESSOR ITERATION ---")
+def parse_folder_from_list_response(folder):
+    """Parses folder name from IMAP LIST response"""
+    folder_str = ""
+    if isinstance(folder, bytes):
+        folder_str = folder.decode('utf-8', errors='ignore')
+    elif isinstance(folder, tuple):
+        decoded_parts = []
+        for part in folder:
+            if isinstance(part, bytes):
+                decoded_parts.append(part.decode('utf-8', errors='ignore'))
+            else:
+                decoded_parts.append(str(part))
+        folder_str = ' '.join(decoded_parts)
+    else:
+        folder_str = str(folder)
     
-    mail = None
+    # Parse IMAP LIST response format: (\\HasNoChildren) "/" "INBOX"
+    # Extract the folder name (last quoted string or unquoted part)
+    folder_name = None
+    quoted_match = re.search(r'"([^"]+)"', folder_str)
+    if quoted_match:
+        folder_name = quoted_match.group(1)
+    else:
+        parts = folder_str.split()
+        if len(parts) > 0:
+            folder_name = parts[-1]
+    
+    return folder_name
+
+def get_message_count(mail, folder_name):
+    """Gets message count for a folder using multiple methods"""
+    # Method 1: STATUS command (most efficient, doesn't require selecting folder)
+    try:
+        status, data = mail.status(folder_name, "(MESSAGES)")
+        if status == 'OK' and data:
+            count_str = str(data[0])
+            count_match = re.search(r'MESSAGES\s+(\d+)', count_str)
+            if count_match:
+                return int(count_match.group(1))
+            # Try alternative format
+            if isinstance(data[0], (bytes, str)):
+                num_match = re.search(r'(\d+)', count_str)
+                if num_match:
+                    return int(num_match.group(1))
+    except (imaplib.IMAP4.error, AttributeError):
+        pass
+    
+    # Method 2: EXAMINE (read-only SELECT)
+    try:
+        status, data = mail.examine(folder_name)
+        if status == 'OK':
+            for item in (data if data else []):
+                item_str = item.decode() if isinstance(item, bytes) else str(item)
+                exists_match = re.search(r'(\d+)\s*EXISTS', item_str, re.IGNORECASE)
+                if exists_match:
+                    msg_count = int(exists_match.group(1))
+                    try:
+                        mail.close()
+                    except Exception:
+                        pass
+                    return msg_count
+            
+            # Search the full response string
+            response_text = str(data) if data else ""
+            exists_match = re.search(r'(\d+)\s*EXISTS', response_text, re.IGNORECASE)
+            if exists_match:
+                msg_count = int(exists_match.group(1))
+                try:
+                    mail.close()
+                except Exception:
+                    pass
+                return msg_count
+            
+            # Try to find number in response
+            if data:
+                for item in data:
+                    if isinstance(item, bytes):
+                        item_str = item.decode('utf-8', errors='ignore')
+                    else:
+                        item_str = str(item)
+                    num_match = re.search(r'\b(\d+)\b', item_str)
+                    if num_match:
+                        potential_count = int(num_match.group(1))
+                        if potential_count >= 0:
+                            try:
+                                mail.close()
+                            except Exception:
+                                pass
+                            return potential_count
+            
+            try:
+                mail.close()
+            except Exception:
+                pass
+    except (imaplib.IMAP4.error, AttributeError):
+        try:
+            # Method 3: STATUS with quoted folder name
+            quoted_folder = f'"{folder_name}"'
+            status, data = mail.status(quoted_folder, "(MESSAGES)")
+            if status == 'OK' and data:
+                count_str = str(data[0])
+                count_match = re.search(r'MESSAGES\s+(\d+)', count_str)
+                if count_match:
+                    return int(count_match.group(1))
+        except (imaplib.IMAP4.error, AttributeError):
+            pass
+    except Exception:
+        pass
+    
+    return None
+
+def parse_internal_date(data_date):
+    """Parses INTERNALDATE from IMAP FETCH response"""
+    date_str = None
+    for item in data_date:
+        if isinstance(item, tuple) and len(item) >= 2:
+            date_response = item[1].decode() if isinstance(item[1], bytes) else str(item[1])
+            date_match = re.search(r'INTERNALDATE\s+"([^"]+)"', date_response)
+            if date_match:
+                date_str = date_match.group(1)
+                break
+            date_match = re.search(r'INTERNALDATE\s+([^\s]+)', date_response)
+            if date_match:
+                date_str = date_match.group(1)
+                break
+    return date_str
+
+def parse_rfc822_size(data_size):
+    """Parses RFC822.SIZE from IMAP FETCH response"""
+    size = 0
+    if data_size:
+        for item in data_size:
+            if isinstance(item, tuple) and len(item) >= 2:
+                size_str = item[1].decode() if isinstance(item[1], bytes) else str(item[1])
+                size_match = re.search(r'RFC822\.SIZE\s+(\d+)', size_str)
+                if size_match:
+                    return int(size_match.group(1))
+                size_match = re.search(r'\(RFC822\.SIZE\s+(\d+)\)', size_str)
+                if size_match:
+                    return int(size_match.group(1))
+    return size
+
+def extract_raw_email(data):
+    """Extracts raw email bytes from IMAP FETCH response"""
+    for response_item in data:
+        if isinstance(response_item, tuple) and len(response_item) >= 2:
+            raw_email = response_item[1]
+            if isinstance(raw_email, bytes):
+                return raw_email
+            elif isinstance(raw_email, str):
+                return raw_email.encode('utf-8')
+    return None
+
+def calculate_cutoff_times(search_window_hours):
+    """Calculates cutoff time and IMAP search date for time window"""
+    now = datetime.datetime.now()
+    cutoff_time = now - datetime.timedelta(hours=search_window_hours)
+    
+    # IMAP SINCE uses date format, so we use the date from cutoff_time
+    if search_window_hours < 24:
+        # For windows less than 24 hours, search from yesterday to catch all possible matches
+        date_since = (now - datetime.timedelta(days=1)).strftime("%d-%b-%Y")
+    else:
+        # For windows >= 24 hours, use the date from cutoff_time
+        date_since = cutoff_time.strftime("%d-%b-%Y")
+    
+    # Convert cutoff_time to UTC for comparison with INTERNALDATE
+    tz_offset_seconds = time.timezone if (time.daylight == 0) else time.altzone
+    tz_offset = datetime.timedelta(seconds=-tz_offset_seconds)
+    cutoff_time_utc = cutoff_time - tz_offset
+    
+    return now, cutoff_time, cutoff_time_utc, date_since
+
+def search_messages_by_date(mail, date_since):
+    """Searches for messages using IMAP SINCE query"""
+    try:
+        status, messages = mail.search(None, f'(SINCE "{date_since}")')
+        if status != 'OK':
+            print(f"Search failed with status: {status}")
+            if messages and len(messages) > 0:
+                print(f"Search response: {messages}")
+            return []
+    except Exception as search_err:
+        print(f"Error executing IMAP search: {search_err}")
+        return []
+    
+    email_ids = messages[0].split() if messages and len(messages) > 0 and messages[0] else []
+    
+    if email_ids:
+        print(f"IMAP search returned {len(email_ids)} message ID(s)")
+    else:
+        print("IMAP search returned 0 messages")
+    
+    return email_ids
+
+def filter_messages_by_time(mail, email_ids, cutoff_time_utc, time_window_str):
+    """Filters messages by INTERNALDATE to match time window"""
+    print(f"\nFound {len(email_ids)} candidate messages from date search.")
+    print("Filtering by actual received time...")
+    
+    filtered_email_ids = []
+    
+    for e_id in email_ids:
+        try:
+            res_date, data_date = mail.fetch(e_id, '(INTERNALDATE)')
+            if res_date == 'OK' and data_date:
+                date_str = parse_internal_date(data_date)
+                
+                if date_str:
+                    try:
+                        msg_date = parsedate_to_datetime(date_str)
+                        if msg_date:
+                            # Convert to UTC naive datetime for comparison
+                            if msg_date.tzinfo:
+                                msg_date_utc = msg_date.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+                            else:
+                                msg_date_utc = msg_date
+                            
+                            # Compare both in UTC
+                            if msg_date_utc >= cutoff_time_utc:
+                                filtered_email_ids.append(e_id)
+                        else:
+                            # Can't parse, include it to be safe
+                            filtered_email_ids.append(e_id)
+                    except Exception as date_parse_err:
+                        print(f"Warning: Could not parse INTERNALDATE for message {e_id.decode()}: {date_parse_err}")
+                        filtered_email_ids.append(e_id)
+                else:
+                    # If we can't get INTERNALDATE, include the message to be safe
+                    filtered_email_ids.append(e_id)
+            else:
+                # If we can't fetch INTERNALDATE, include the message to be safe
+                filtered_email_ids.append(e_id)
+        except Exception as fetch_err:
+            print(f"Warning: Could not fetch INTERNALDATE for message {e_id.decode()}: {fetch_err}")
+            filtered_email_ids.append(e_id)
+    
+    print(f"After time filtering: {len(filtered_email_ids)} messages within the {time_window_str} window.")
+    return filtered_email_ids
+
+def analyze_message_headers(mail, email_ids):
+    """Analyzes message headers and returns spam candidates with metadata"""
+    print(f"\nFound {len(email_ids)} candidate messages.")
+    print("Analyzing headers...")
+    
     spam_candidates = []
     total_size_bytes = 0
     
-    # ---------------------------------------------------------
-    # PHASE 1: CONNECT AND IDENTIFY (READ-ONLY)
-    # ---------------------------------------------------------
-    try:
-        print(f"Connecting to {GMAIL_ACCOUNT}...")
-        mail = imaplib.IMAP4_SSL('imap.gmail.com')
-        mail.login(GMAIL_ACCOUNT, APP_PASS)
-        
-        # First, list all folders to get exact folder names
-        print("Listing all available mailboxes to find spam folder...")
-        all_folder_names = []
-        spam_candidate_names = []
+    for e_id in email_ids:
         try:
-            status, folders = mail.list()
-            if status == 'OK':
-                for folder in folders:
-                    folder_str = ""
-                    if isinstance(folder, bytes):
-                        folder_str = folder.decode('utf-8', errors='ignore')
-                    elif isinstance(folder, tuple):
-                        decoded_parts = []
-                        for part in folder:
-                            if isinstance(part, bytes):
-                                decoded_parts.append(part.decode('utf-8', errors='ignore'))
-                            else:
-                                decoded_parts.append(str(part))
-                        folder_str = ' '.join(decoded_parts)
-                    else:
-                        folder_str = str(folder)
-                    
-                    # Parse IMAP LIST response format: (\\HasNoChildren) "/" "INBOX"
-                    # or: (\\HasChildren \\Noselect) "/" "[Gmail]"
-                    # Extract the folder name (last quoted string or unquoted part)
-                    folder_name = None
-                    # Try to extract quoted folder name
-                    quoted_match = re.search(r'"([^"]+)"', folder_str)
-                    if quoted_match:
-                        folder_name = quoted_match.group(1)
-                    else:
-                        # If no quotes, try to get the last part after spaces
-                        parts = folder_str.split()
-                        if len(parts) > 0:
-                            folder_name = parts[-1]
-                    
-                    if folder_name:
-                        all_folder_names.append(folder_name)
-                        folder_upper = folder_name.upper()
-                        # Identify spam/junk folders (but exclude INBOX)
-                        if ('SPAM' in folder_upper or 'JUNK' in folder_upper) and 'INBOX' not in folder_upper:
-                            spam_candidate_names.append(folder_name)
-        except Exception as list_err:
-            print(f"Warning: Could not list mailboxes: {list_err}")
-        
-        # Print found folders for debugging
-        if all_folder_names:
-            print(f"Found {len(all_folder_names)} mailboxes")
-            if spam_candidate_names:
-                print(f"Spam/Junk folder candidates: {spam_candidate_names}")
-        
-        # On initial run, show message counts for all folders
-        initial_listing_flag_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.spamcop_initial_listing_complete')
-        is_initial_run = not os.path.exists(initial_listing_flag_file)
-        
-        if is_initial_run and all_folder_names:
-            print("\n" + "="*70)
-            print("INITIAL RUN - FOLDER MESSAGE COUNTS")
-            print("="*70)
-            print("Getting message counts for all folders...")
-            print()
+            # Fetch size
+            res_size, data_size = mail.fetch(e_id, '(RFC822.SIZE)')
+            size = parse_rfc822_size(data_size)
+            if size == 0:
+                size = DEFAULT_SIZE_KB
             
-            folder_counts = []
-            for folder_name in all_folder_names:
-                # Skip INBOX for security
-                if folder_name.upper() == 'INBOX':
-                    continue
-                
-                msg_count = None
-                try:
-                    # Get message count using STATUS command
-                    # Note: Some folders (like parent folders) may not support STATUS
-                    status, data = mail.status(folder_name, "(MESSAGES)")
-                    if status == 'OK' and data:
-                        # Parse message count from response like: (MESSAGES 123)
-                        # Response format can vary: b'(MESSAGES 123)' or ('MESSAGES', 123)
-                        count_str = str(data[0])
-                        count_match = re.search(r'MESSAGES\s+(\d+)', count_str)
-                        if count_match:
-                            msg_count = int(count_match.group(1))
-                        else:
-                            # Try alternative format
-                            if isinstance(data[0], (bytes, str)):
-                                # Try to find number directly
-                                num_match = re.search(r'(\d+)', count_str)
-                                if num_match:
-                                    msg_count = int(num_match.group(1))
-                except imaplib.IMAP4.error:
-                    # Folder might not support STATUS (e.g., parent folders like [Gmail])
-                    msg_count = None
-                except Exception as status_err:
-                    # Other errors - mark as unknown
-                    msg_count = None
-                
-                # Add to list (None will be displayed as "N/A")
-                folder_counts.append((folder_name, msg_count))
+            # Fetch header
+            res_header, data_header = mail.fetch(e_id, '(BODY.PEEK[HEADER])')
+            raw_header = None
+            if res_header == 'OK' and data_header:
+                for item in data_header:
+                    if isinstance(item, tuple) and len(item) >= 2:
+                        raw_header = item[1]
+                        if isinstance(raw_header, bytes):
+                            break
+                        elif isinstance(raw_header, str):
+                            raw_header = raw_header.encode()
+                            break
             
-            # Sort by message count (descending) for better visibility
-            # Put None values at the end
-            folder_counts.sort(key=lambda x: (x[1] is None, x[1] if x[1] is not None else 0), reverse=True)
-            
-            # Display the counts
-            print(f"{'Folder Name':<40} {'Messages':>10}")
-            print("-" * 70)
-            total_messages = 0
-            folders_with_counts = 0
-            for folder_name, count in folder_counts:
-                if count is not None:
-                    print(f"{folder_name:<40} {count:>10,}")
-                    total_messages += count
-                    folders_with_counts += 1
-                else:
-                    print(f"{folder_name:<40} {'N/A':>10}")
-            print("-" * 70)
-            if folders_with_counts > 0:
-                print(f"{'TOTAL (countable folders)':<40} {total_messages:>10,}")
-            print(f"{'Folders with message counts':<40} {folders_with_counts:>10}")
-            print("="*70)
-            print()
-            
-            # Mark initial listing as complete
-            try:
-                with open(initial_listing_flag_file, 'w') as f:
-                    f.write(f"Initial folder listing completed: {datetime.datetime.now().isoformat()}\n")
-            except Exception as e:
-                print(f"Warning: Could not create initial listing flag file: {e}")
-        
-        # CRITICAL SAFETY: readonly=True ensures NO deletion/modification possible
-        # ABSOLUTE REQUIREMENT: ONLY access spam folder, NEVER INBOX
-        # Build list of folders to try: start with candidates from LIST, then fallback to common names
-        spam_folders = []
-        
-        # First, try the exact folder names we found from LIST
-        for candidate in spam_candidate_names:
-            if candidate not in spam_folders:
-                spam_folders.append(candidate)
-        
-        # Then add common Gmail spam folder names (if not already added)
-        common_names = [
-            '[Gmail]/Spam',      # Most common Gmail format
-            '"[Gmail]/Spam"',    # Quoted version
-            '[Google Mail]/Spam', # Alternative Gmail folder name
-            'Spam',              # Simple name (some IMAP clients)
-            '[Gmail]/Junk',      # Some accounts use Junk
-            'Junk'               # Simple Junk folder name
-        ]
-        for name in common_names:
-            if name not in spam_folders:
-                spam_folders.append(name)
-        
-        mailbox_selected = False
-        selected_folder = None
-        
-        # FORBIDDEN: Never try INBOX - this is a hard requirement
-        FORBIDDEN_FOLDERS = ['INBOX', 'inbox', 'Inbox', '"INBOX"']
-        
-        for folder_name in spam_folders:
-            # Safety check: never allow INBOX
-            if folder_name.upper().replace('"', '').replace("'", '') == 'INBOX':
-                print(f"SECURITY ERROR: Attempted to access forbidden folder: {folder_name}")
-                raise imaplib.IMAP4.error(f"SECURITY VIOLATION: Cannot access {folder_name}. Only spam folders are allowed.")
-            
-            try:
-                status, data = mail.select(folder_name, readonly=True)
-                if status == 'OK':
-                    # CRITICAL SAFETY CHECK 1: Verify we did NOT select INBOX
-                    normalized_name = folder_name.upper().replace('"', '').replace("'", '').replace('\\', '/').replace('[', '').replace(']', '')
-                    if normalized_name == 'INBOX' or normalized_name.endswith('/INBOX') or normalized_name.startswith('INBOX/'):
-                        print(f"SECURITY ERROR: Selected forbidden folder: {folder_name}")
-                        mail.close()
-                        raise imaplib.IMAP4.error(f"SECURITY VIOLATION: Cannot access {folder_name}. Only spam/junk folders are allowed.")
-                    
-                    # CRITICAL SAFETY CHECK 2: Verify folder name contains SPAM or JUNK
-                    if 'SPAM' not in normalized_name and 'JUNK' not in normalized_name:
-                        print(f"SECURITY ERROR: Selected folder '{folder_name}' does not contain 'SPAM' or 'JUNK'!")
-                        mail.close()
-                        raise imaplib.IMAP4.error(f"SECURITY VIOLATION: Folder '{folder_name}' is not a spam/junk folder. Access denied.")
-                    
-                    selected_folder = folder_name
-                    mailbox_selected = True
-                    
-                    # Get message count to verify this is the right folder
-                    msg_count = 0
-                    try:
-                        status, message_count = mail.status(folder_name, "(MESSAGES)")
-                        if status == 'OK' and message_count:
-                            # Parse message count from response like: (MESSAGES 123)
-                            count_match = re.search(r'MESSAGES\s+(\d+)', str(message_count[0]))
-                            if count_match:
-                                msg_count = int(count_match.group(1))
-                                print(f"Successfully selected SPAM/JUNK mailbox: {folder_name} ({msg_count} messages)")
-                            else:
-                                print(f"Successfully selected SPAM/JUNK mailbox: {folder_name}")
-                        else:
-                            print(f"Successfully selected SPAM/JUNK mailbox: {folder_name}")
-                    except Exception as status_err:
-                        print(f"Successfully selected SPAM/JUNK mailbox: {folder_name} (could not get message count: {status_err})")
-                    
-                    # Warn if folder is empty - might be the wrong folder
-                    if msg_count == 0:
-                        print(f"WARNING: Selected folder '{folder_name}' has 0 messages. This might not be the correct spam folder.")
-                        print("If you know there is spam, please check the folder list above and verify the correct folder name.")
-                    
-                    break
-                else:
-                    print(f"Failed to select '{folder_name}': status={status}")
-            except imaplib.IMAP4.error as select_err:
-                # Check if error is because we tried to access INBOX
-                if 'INBOX' in str(select_err).upper() or folder_name.upper().replace('"', '').replace("'", '') == 'INBOX':
-                    print(f"SECURITY ERROR: Attempted to access forbidden folder: {folder_name}")
-                    raise imaplib.IMAP4.error(f"SECURITY VIOLATION: Cannot access {folder_name}. Only spam folders are allowed.")
-                print(f"Error selecting '{folder_name}': {select_err}")
+            if raw_header is None:
+                print(f"Warning: Could not fetch header for message {e_id.decode()}")
                 continue
-        
-        if not mailbox_selected:
-            print("=" * 70)
-            print("CRITICAL ERROR: Could not select SPAM mailbox!")
-            print("=" * 70)
-            print("The script will NOT proceed without a valid spam folder selection.")
-            print("Listing ALL available mailboxes to help identify the correct spam folder name...")
-            print()
-            try:
-                status, folders = mail.list()
-                if status == 'OK':
-                    print("ALL available mailboxes:")
-                    all_folders = []
-                    spam_candidates_found = []
-                    for folder in folders:
-                        folder_str = ""
-                        if isinstance(folder, bytes):
-                            folder_str = folder.decode('utf-8', errors='ignore')
-                        elif isinstance(folder, tuple):
-                            decoded_parts = []
-                            for part in folder:
-                                if isinstance(part, bytes):
-                                    decoded_parts.append(part.decode('utf-8', errors='ignore'))
-                                else:
-                                    decoded_parts.append(str(part))
-                            folder_str = ' '.join(decoded_parts)
-                        else:
-                            folder_str = str(folder)
-                        
-                        all_folders.append(folder_str)
-                        folder_upper = folder_str.upper()
-                        # Identify spam/junk folders
-                        if ('SPAM' in folder_upper or 'JUNK' in folder_upper) and 'INBOX' not in folder_upper:
-                            spam_candidates_found.append(folder_str)
-                    
-                    # Print all folders
-                    for folder in all_folders:
-                        print(f"  {folder}")
-                    
-                    if spam_candidates_found:
-                        print()
-                        print("Spam/Junk folder candidates found:")
-                        for candidate in spam_candidates_found:
-                            print(f"  - {candidate}")
-                        print()
-                        print("Please check the exact folder name and update the code if needed.")
-                    else:
-                        print()
-                        print("WARNING: No folders containing 'SPAM' or 'JUNK' were found in the list above.")
-                        print("Please manually identify the spam folder from the list above.")
-            except Exception as list_err:
-                print(f"Could not list mailboxes: {list_err}")
             
-            print("=" * 70)
-            if mail:
-                try: 
-                    mail.close()
-                    mail.logout()
-                except: pass
-            raise imaplib.IMAP4.error("SECURITY: Failed to select spam mailbox. Script aborted to prevent INBOX access.")
-        
-        
-        # FINAL SAFETY CHECK: Verify selected folder is SPAM or JUNK ONLY
-        if selected_folder:
-            normalized = selected_folder.upper().replace('"', '').replace("'", '').replace('\\', '/').replace('[', '').replace(']', '')
+            total_size_bytes += size
             
-            # Check 1: Must NOT be INBOX
-            if normalized == 'INBOX' or normalized.endswith('/INBOX') or normalized.startswith('INBOX/'):
-                print(f"SECURITY ERROR: Selected folder '{selected_folder}' appears to be INBOX!")
-                mail.close()
-                mail.logout()
-                raise imaplib.IMAP4.error(f"SECURITY VIOLATION: Selected folder '{selected_folder}' is forbidden. Only spam/junk folders allowed.")
+            msg_header = email.message_from_bytes(raw_header)
+            subject_raw = msg_header['Subject']
+            subject = decode_email_header(subject_raw) if subject_raw else "(No Subject)"
+            date_str = msg_header['Date']
             
-            # Check 2: MUST contain SPAM or JUNK
-            if 'SPAM' not in normalized and 'JUNK' not in normalized:
-                print(f"SECURITY ERROR: Selected folder '{selected_folder}' does not contain 'SPAM' or 'JUNK'!")
-                mail.close()
-                mail.logout()
-                raise imaplib.IMAP4.error(f"SECURITY VIOLATION: Selected folder '{selected_folder}' is not a spam/junk folder. Access denied.")
-        
-        # Time window: Based on SPAM_SEARCH_WINDOW_HOURS
-        # IMAP SINCE uses date format, so we use the date from hours_ago
-        hours_ago = datetime.datetime.now() - datetime.timedelta(hours=SPAM_SEARCH_WINDOW_HOURS)
-        date_since = hours_ago.strftime("%d-%b-%Y")
-        
-        # Format time window for display
-        if SPAM_SEARCH_WINDOW_HOURS < 1:
-            time_window_str = f"{int(SPAM_SEARCH_WINDOW_HOURS * 60)} minutes"
-        elif SPAM_SEARCH_WINDOW_HOURS == 1:
-            time_window_str = "1 hour"
-        else:
-            time_window_str = f"{SPAM_SEARCH_WINDOW_HOURS} hours"
-        
-        print(f"Searching for spam received since {date_since} (past {time_window_str})...")
-        print(f"Current time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Search window start: {hours_ago.strftime('%Y-%m-%d %H:%M:%S')}")
-        
-        # Fetch list of IDs - use SINCE for received date (not SENTSINCE which is sent date)
-        # Note: IMAP SINCE is date-based, not time-based, so for very small windows (< 1 day),
-        # we may get emails from earlier in the same day, but we'll filter by actual received time later if needed
-        try:
-            status, messages = mail.search(None, f'(SINCE "{date_since}")')
-            if status != 'OK':
-                print(f"Search failed with status: {status}")
-                if messages and len(messages) > 0:
-                    print(f"Search response: {messages}")
-                if mail:
-                    try: mail.logout()
-                    except: pass
-                return
-        except Exception as search_err:
-            print(f"Error executing IMAP search: {search_err}")
-            if mail:
-                try: mail.logout()
-                except: pass
-            return
+            spam_candidates.append({
+                'id': e_id,
+                'subject': subject,
+                'date': date_str,
+                'size': size
+            })
             
-        email_ids = messages[0].split() if messages and len(messages) > 0 and messages[0] else []
-        
-        # Log search results
-        if email_ids:
-            print(f"IMAP search returned {len(email_ids)} message ID(s)")
-        else:
-            print("IMAP search returned 0 messages")
-        
-        if not email_ids:
-            if SPAM_SEARCH_WINDOW_HOURS < 1:
-                hours_str = f"{int(SPAM_SEARCH_WINDOW_HOURS * 60)} minutes"
-            elif SPAM_SEARCH_WINDOW_HOURS == 1:
-                hours_str = "1 hour"
-            else:
-                hours_str = f"{SPAM_SEARCH_WINDOW_HOURS} hours"
-            print(f"No spam found in the past {hours_str}.")
-            if mail:
-                try: mail.logout()
-                except: pass
-            return
+            display_subject = safe_print_subject(subject, 50)
+            print(f" - Identified: {display_subject}... ({int(size/1024)} KB)")
+        except Exception as e:
+            print(f"Warning: Error processing message {e_id.decode()}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    return spam_candidates, total_size_bytes
 
-        print(f"\nFound {len(email_ids)} candidate messages.")
-        
-        # Pre-fetch Headers to calculate stats BEFORE downloading bodies
-        print("Analyzing headers...")
-        for e_id in email_ids:
-            try:
-                # Fetch size and header separately for more reliable parsing
-                # First get the size
-                res_size, data_size = mail.fetch(e_id, '(RFC822.SIZE)')
-                size = 0
-                if res_size == 'OK' and data_size:
-                    for item in data_size:
-                        if isinstance(item, tuple) and len(item) >= 2:
-                            size_str = item[1].decode() if isinstance(item[1], bytes) else str(item[1])
-                            size_match = re.search(r'RFC822\.SIZE\s+(\d+)', size_str)
-                            if size_match:
-                                size = int(size_match.group(1))
-                                break
-                            # Try alternative format
-                            size_match = re.search(r'\(RFC822\.SIZE\s+(\d+)\)', size_str)
-                            if size_match:
-                                size = int(size_match.group(1))
-                                break
-                
-                # If size still not found, use default
-                if size == 0:
-                    size = 1024  # Default 1KB if we can't determine
-                
-                # Now get the header
-                res_header, data_header = mail.fetch(e_id, '(BODY.PEEK[HEADER])')
-                raw_header = None
-                if res_header == 'OK' and data_header:
-                    for item in data_header:
-                        if isinstance(item, tuple) and len(item) >= 2:
-                            raw_header = item[1]
-                            if isinstance(raw_header, bytes):
-                                break
-                            elif isinstance(raw_header, str):
-                                raw_header = raw_header.encode()
-                                break
-                
-                if raw_header is None:
-                    print(f"Warning: Could not fetch header for message {e_id.decode()}")
-                    continue
-                
-                total_size_bytes += size
-                
-                msg_header = email.message_from_bytes(raw_header)
-                subject_raw = msg_header['Subject']
-                # Decode the subject if it's encoded
-                subject = decode_email_header(subject_raw) if subject_raw else "(No Subject)"
-                date_str = msg_header['Date']
-                
-                # Store for later
-                spam_candidates.append({
-                    'id': e_id,
-                    'subject': subject,
-                    'date': date_str,
-                    'size': size
-                })
-                # Display subject safely (handle unicode/emoji for Windows console)
-                display_subject = safe_print_subject(subject, 50)
-                print(f" - Identified: {display_subject}... ({int(size/1024)} KB)")
-            except Exception as e:
-                print(f"Warning: Error processing message {e_id.decode()}: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
-
-    except imaplib.IMAP4.error as e:
-        print(f"IMAP Error: {e}")
-        print("\nAUTHENTICATION TROUBLESHOOTING:")
-        print("=" * 50)
-        print("Option 1: Try your regular Gmail password")
-        print("  - Some accounts can still use regular passwords")
-        print("  - If this doesn't work, proceed to Option 2")
-        print("\nOption 2: Use Gmail App Password (requires 2FA)")
-        print("  - Go to: https://myaccount.google.com/security")
-        print("  - Enable '2-Step Verification' first")
-        print("  - Then go to: https://myaccount.google.com/apppasswords")
-        print("  - Generate an App Password for 'Mail'")
-        print("  - Use that 16-character password (no spaces) in APP_PASS")
-        print("\nOption 3: Enable 'Less Secure App Access' (if available)")
-        print("  - Go to: https://myaccount.google.com/lesssecureapps")
-        print("  - Note: This option is deprecated and may not be available")
-        print("=" * 50)
-        if mail:
-            try: mail.logout()
-            except: pass
-        return
-    except Exception as e:
-        print(f"Error during connection/search: {e}")
-        if mail:
-            try: mail.logout()
-            except: pass
-        return
-
-    # ---------------------------------------------------------
-    # PHASE 2: DOWNLOAD (Non-interactive - always proceed)
-    # ---------------------------------------------------------
-    if not spam_candidates:
-        print("No spam candidates to download.")
-        if mail:
-            try: mail.logout()
-            except: pass
-        return
-        
+def download_messages(mail, spam_candidates, total_size_bytes):
+    """Downloads messages to disk and returns list of file paths"""
     print("\n" + "="*40)
     print(f"Identified {len(spam_candidates)} emails. Total Size: {get_size_str(total_size_bytes)}.")
     print("Proceeding with download (non-interactive mode)...")
 
-    # ---------------------------------------------------------
-    # PHASE 3: CREATE FOLDER AND DOWNLOAD
-    # ---------------------------------------------------------
     # Construct Folder Name: [Account]__YYYY-MM-DD__HHMMSS__Count__Size
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d__%H%M%S")
     account_tag = f"[{GMAIL_ACCOUNT.split('@')[0]}]"
@@ -786,17 +669,8 @@ def process_spam_iteration():
                 print(f"Warning: Could not fetch body for message {item['id'].decode()}")
                 continue
             
-            # Extract raw email from fetch response
-            raw_email = None
-            for response_item in data:
-                if isinstance(response_item, tuple) and len(response_item) >= 2:
-                    raw_email = response_item[1]
-                    if isinstance(raw_email, bytes):
-                        break
-                    elif isinstance(raw_email, str):
-                        raw_email = raw_email.encode('utf-8')
-                        break
-            
+            # Extract raw email
+            raw_email = extract_raw_email(data)
             if raw_email is None:
                 print(f"Warning: Failed to fetch raw email for message ID {item['id'].decode()}. Skipping.")
                 continue
@@ -807,12 +681,11 @@ def process_spam_iteration():
                     dt = parsedate_to_datetime(item['date'])
                     if dt: 
                         timestamps.append(dt)
-                except: 
+                except Exception:
                     pass
 
             # Save file
             clean_sub = sanitize_filename(item['subject'])
-            # Shorten filename if too long
             clean_sub = (clean_sub[:50] + '..') if len(clean_sub) > 50 else clean_sub
             filename = f"{clean_sub}_{item['id'].decode()}.eml"
             filepath = os.path.join(download_path, filename)
@@ -830,14 +703,340 @@ def process_spam_iteration():
             import traceback
             traceback.print_exc()
             continue
+    
+    return downloaded_files, timestamps
 
-    # Close IMAP connection (Mission Accomplished)
+def _handle_imap_error(e, mail):
+    """Handles IMAP errors with authentication troubleshooting"""
+    print(f"IMAP Error: {e}")
+    print("\nAUTHENTICATION TROUBLESHOOTING:")
+    print("=" * 50)
+    print("Option 1: Try your regular Gmail password")
+    print("  - Some accounts can still use regular passwords")
+    print("  - If this doesn't work, proceed to Option 2")
+    print("\nOption 2: Use Gmail App Password (requires 2FA)")
+    print("  - Go to: https://myaccount.google.com/security")
+    print("  - Enable '2-Step Verification' first")
+    print("  - Then go to: https://myaccount.google.com/apppasswords")
+    print("  - Generate an App Password for 'Mail'")
+    print("  - Use that 16-character password (no spaces) in APP_PASS")
+    print("\nOption 3: Enable 'Less Secure App Access' (if available)")
+    print("  - Go to: https://myaccount.google.com/lesssecureapps")
+    print("  - Note: This option is deprecated and may not be available")
+    print("=" * 50)
+    safe_logout(mail)
+
+def connect_imap():
+    """Connects to IMAP server and logs in"""
+    print(f"Connecting to {GMAIL_ACCOUNT}...")
+    mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+    mail.login(GMAIL_ACCOUNT, APP_PASS)
+    return mail
+
+def list_all_folders(mail):
+    """Lists all folders and identifies spam folder candidates"""
+    print("Listing all available mailboxes to find spam folder...")
+    all_folder_names = []
+    spam_candidate_names = []
+    
+    try:
+        status, folders = mail.list()
+        if status == 'OK':
+            for folder in folders:
+                folder_name = parse_folder_from_list_response(folder)
+                if folder_name:
+                    all_folder_names.append(folder_name)
+                    folder_upper = folder_name.upper()
+                    if ('SPAM' in folder_upper or 'JUNK' in folder_upper) and 'INBOX' not in folder_upper:
+                        spam_candidate_names.append(folder_name)
+    except Exception as list_err:
+        print(f"Warning: Could not list mailboxes: {list_err}")
+    
+    if all_folder_names:
+        print(f"Found {len(all_folder_names)} mailboxes")
+        if spam_candidate_names:
+            print(f"Spam/Junk folder candidates: {spam_candidate_names}")
+    
+    return all_folder_names, spam_candidate_names
+
+def display_folder_counts(mail, all_folder_names):
+    """Displays message counts for all folders"""
+    if not all_folder_names:
+        return
+    
+    print("\n" + "="*70)
+    print("FOLDER MESSAGE COUNTS")
+    print("="*70)
+    print("Getting message counts for all folders...")
+    print()
+    
+    folder_counts = []
+    for folder_name in all_folder_names:
+        # Skip INBOX for security
+        if folder_name.upper() == 'INBOX':
+            continue
+        
+        msg_count = get_message_count(mail, folder_name)
+        folder_counts.append((folder_name, msg_count))
+    
+    # Sort by message count (descending)
+    folder_counts.sort(key=lambda x: (x[1] is None, x[1] if x[1] is not None else 0), reverse=True)
+    
+    # Display the counts
+    print(f"{'Folder Name':<40} {'Messages':>10}")
+    print("-" * 70)
+    total_messages = 0
+    folders_with_counts = 0
+    for folder_name, count in folder_counts:
+        if count is not None:
+            print(f"{folder_name:<40} {count:>10,}")
+            total_messages += count
+            folders_with_counts += 1
+        else:
+            print(f"{folder_name:<40} {'N/A':>10}")
+    print("-" * 70)
+    if folders_with_counts > 0:
+        print(f"{'TOTAL (countable folders)':<40} {total_messages:>10,}")
+    print(f"{'Folders with message counts':<40} {folders_with_counts:>10}")
+    print("="*70)
+    print()
+
+def find_and_select_spam_folder(mail, spam_candidate_names):
+    """Finds and selects the spam folder, with security checks"""
+    spam_folders = []
+    
+    # Add candidates from LIST
+    for candidate in spam_candidate_names:
+        if candidate not in spam_folders:
+            spam_folders.append(candidate)
+    
+    # Add common names
+    for name in COMMON_SPAM_FOLDER_NAMES:
+        if name not in spam_folders:
+            spam_folders.append(name)
+    
+    selected_folder = None
+    
+    for folder_name in spam_folders:
+        # Safety check: never allow INBOX
+        if is_forbidden_folder(folder_name):
+            print(f"SECURITY ERROR: Attempted to access forbidden folder: {folder_name}")
+            raise imaplib.IMAP4.error(f"SECURITY VIOLATION: Cannot access {folder_name}. Only spam folders are allowed.")
+        
+        try:
+            status, data = mail.select(folder_name, readonly=True)
+            if status == 'OK':
+                # Verify we did NOT select INBOX
+                normalized_name = normalize_folder_name(folder_name)
+                if normalized_name == 'INBOX' or normalized_name.endswith('/INBOX') or normalized_name.startswith('INBOX/'):
+                    print(f"SECURITY ERROR: Selected forbidden folder: {folder_name}")
+                    mail.close()
+                    raise imaplib.IMAP4.error(f"SECURITY VIOLATION: Cannot access {folder_name}. Only spam/junk folders are allowed.")
+                
+                # Verify folder name contains SPAM or JUNK
+                if not is_spam_folder(folder_name):
+                    print(f"SECURITY ERROR: Selected folder '{folder_name}' does not contain 'SPAM' or 'JUNK'!")
+                    mail.close()
+                    raise imaplib.IMAP4.error(f"SECURITY VIOLATION: Folder '{folder_name}' is not a spam/junk folder. Access denied.")
+                
+                selected_folder = folder_name
+                
+                # Get message count
+                msg_count = 0
+                try:
+                    status, message_count = mail.status(folder_name, "(MESSAGES)")
+                    if status == 'OK' and message_count:
+                        count_match = re.search(r'MESSAGES\s+(\d+)', str(message_count[0]))
+                        if count_match:
+                            msg_count = int(count_match.group(1))
+                            print(f"Successfully selected SPAM/JUNK mailbox: {folder_name} ({msg_count} messages)")
+                        else:
+                            print(f"Successfully selected SPAM/JUNK mailbox: {folder_name}")
+                    else:
+                        print(f"Successfully selected SPAM/JUNK mailbox: {folder_name}")
+                except Exception as status_err:
+                    print(f"Successfully selected SPAM/JUNK mailbox: {folder_name} (could not get message count: {status_err})")
+                
+                if msg_count == 0:
+                    print(f"WARNING: Selected folder '{folder_name}' has 0 messages. This might not be the correct spam folder.")
+                    print("If you know there is spam, please check the folder list above and verify the correct folder name.")
+                
+                break
+            else:
+                print(f"Failed to select '{folder_name}': status={status}")
+        except imaplib.IMAP4.error as select_err:
+            if 'INBOX' in str(select_err).upper() or is_forbidden_folder(folder_name):
+                print(f"SECURITY ERROR: Attempted to access forbidden folder: {folder_name}")
+                raise imaplib.IMAP4.error(f"SECURITY VIOLATION: Cannot access {folder_name}. Only spam folders are allowed.")
+            print(f"Error selecting '{folder_name}': {select_err}")
+            continue
+    
+    if not selected_folder:
+        _print_folder_selection_error(mail)
+        raise imaplib.IMAP4.error("SECURITY: Failed to select spam mailbox. Script aborted to prevent INBOX access.")
+    
+    # Final safety check
+    normalized = normalize_folder_name(selected_folder)
+    if normalized == 'INBOX' or normalized.endswith('/INBOX') or normalized.startswith('INBOX/'):
+        print(f"SECURITY ERROR: Selected folder '{selected_folder}' appears to be INBOX!")
+        mail.close()
+        mail.logout()
+        raise imaplib.IMAP4.error(f"SECURITY VIOLATION: Selected folder '{selected_folder}' is forbidden. Only spam/junk folders allowed.")
+    
+    if not is_spam_folder(selected_folder):
+        print(f"SECURITY ERROR: Selected folder '{selected_folder}' does not contain 'SPAM' or 'JUNK'!")
+        mail.close()
+        mail.logout()
+        raise imaplib.IMAP4.error(f"SECURITY VIOLATION: Selected folder '{selected_folder}' is not a spam/junk folder. Access denied.")
+    
+    return selected_folder
+
+def _print_folder_selection_error(mail):
+    """Prints detailed error when spam folder cannot be selected"""
+    print("=" * 70)
+    print("CRITICAL ERROR: Could not select SPAM mailbox!")
+    print("=" * 70)
+    print("The script will NOT proceed without a valid spam folder selection.")
+    print("Listing ALL available mailboxes to help identify the correct spam folder name...")
+    print()
+    try:
+        status, folders = mail.list()
+        if status == 'OK':
+            print("ALL available mailboxes:")
+            all_folders = []
+            spam_candidates_found = []
+            for folder in folders:
+                folder_str = ""
+                if isinstance(folder, bytes):
+                    folder_str = folder.decode('utf-8', errors='ignore')
+                elif isinstance(folder, tuple):
+                    decoded_parts = []
+                    for part in folder:
+                        if isinstance(part, bytes):
+                            decoded_parts.append(part.decode('utf-8', errors='ignore'))
+                        else:
+                            decoded_parts.append(str(part))
+                    folder_str = ' '.join(decoded_parts)
+                else:
+                    folder_str = str(folder)
+                
+                all_folders.append(folder_str)
+                folder_upper = folder_str.upper()
+                if ('SPAM' in folder_upper or 'JUNK' in folder_upper) and 'INBOX' not in folder_upper:
+                    spam_candidates_found.append(folder_str)
+            
+            for folder in all_folders:
+                print(f"  {folder}")
+            
+            if spam_candidates_found:
+                print()
+                print("Spam/Junk folder candidates found:")
+                for candidate in spam_candidates_found:
+                    print(f"  - {candidate}")
+                print()
+                print("Please check the exact folder name and update the code if needed.")
+            else:
+                print()
+                print("WARNING: No folders containing 'SPAM' or 'JUNK' were found in the list above.")
+                print("Please manually identify the spam folder from the list above.")
+    except Exception as list_err:
+        print(f"Could not list mailboxes: {list_err}")
+    
+    print("=" * 70)
+
+def process_spam_iteration():
+    """Processes one iteration of spam download and forwarding"""
+    print("--- STARTING SPAM PROCESSOR ITERATION ---")
+    
+    mail = None
+    spam_candidates = []
+    total_size_bytes = 0
+    
+    # ---------------------------------------------------------
+    # PHASE 1: CONNECT AND IDENTIFY (READ-ONLY)
+    # ---------------------------------------------------------
+    try:
+        mail = connect_imap()
+        
+        all_folder_names, spam_candidate_names = list_all_folders(mail)
+        if all_folder_names:
+            display_folder_counts(mail, all_folder_names)
+        
+        selected_folder = find_and_select_spam_folder(mail, spam_candidate_names)
+        
+        # Calculate time window and search dates
+        now, cutoff_time, cutoff_time_utc, date_since = calculate_cutoff_times(SPAM_SEARCH_WINDOW_HOURS)
+        time_window_str = format_hours_as_string(SPAM_SEARCH_WINDOW_HOURS)
+        
+        print(f"Searching for spam received since {date_since} (past {time_window_str})...")
+        print(f"Current time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Search window start: {cutoff_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Search for messages
+        email_ids = search_messages_by_date(mail, date_since)
+        if not email_ids:
+            print(f"No spam found in the past {time_window_str}.")
+            safe_logout(mail)
+            return
+        
+        # Filter by INTERNALDATE
+        email_ids = filter_messages_by_time(mail, email_ids, cutoff_time_utc, time_window_str)
+        if not email_ids:
+            print(f"No spam found in the past {time_window_str}.")
+            safe_logout(mail)
+            return
+
+        # Analyze headers
+        spam_candidates, total_size_bytes = analyze_message_headers(mail, email_ids)
+    
+    except imaplib.IMAP4.error as e:
+        # If we failed to find spam folders, re-raise so run_spam_processor can handle first-run abort
+        if "Failed to select spam mailbox" in str(e) or "spam mailbox" in str(e).lower():
+            safe_logout(mail)
+            raise  # Re-raise so run_spam_processor can check if it's first run
+        _handle_imap_error(e, mail)
+        return
+    except Exception as e:
+        error_str = str(e).lower()
+        # If error is about spam folder detection, re-raise for first-run handling
+        if "spam" in error_str and ("folder" in error_str or "mailbox" in error_str):
+            safe_logout(mail)
+            raise  # Re-raise so run_spam_processor can check if it's first run
+        print(f"Error during connection/search: {e}")
+        safe_logout(mail)
+        return
+
+    # ---------------------------------------------------------
+    # PHASE 2: DOWNLOAD (Non-interactive - always proceed)
+    # ---------------------------------------------------------
+    if not spam_candidates:
+        print("No spam candidates to download.")
+        safe_logout(mail)
+        return
+    
+    downloaded_files, timestamps = download_messages(mail, spam_candidates, total_size_bytes)
+    
+    # Close IMAP connection
     mail.close()
     mail.logout()
 
     # ---------------------------------------------------------
     # PHASE 4: REPORT STATISTICS
     # ---------------------------------------------------------
+    print_statistics(downloaded_files, total_size_bytes, timestamps)
+    
+    # ---------------------------------------------------------
+    # PHASE 5: FORWARD TO SPAMCOP (With first-run confirmation)
+    # ---------------------------------------------------------
+    if len(downloaded_files) > 0:
+        forward_to_spamcop(downloaded_files, spam_candidates, total_size_bytes)
+    else:
+        print("\nSkipping send. Files remain in your local folder.")
+
+    print("\n--- ITERATION COMPLETE ---")
+
+def print_statistics(downloaded_files, total_size_bytes, timestamps):
+    """Prints download statistics"""
     print("\n" + "="*40)
     print("DOWNLOAD STATISTICS")
     print("="*40)
@@ -856,138 +1055,156 @@ def process_spam_iteration():
     else:
         print("Time Span:         Could not calculate (invalid date headers)")
 
-    # ---------------------------------------------------------
-    # PHASE 5: FORWARD TO SPAMCOP (With first-run confirmation)
-    # ---------------------------------------------------------
-    if len(downloaded_files) > 0:
-        # Check if this is the first run (first-time confirmation required)
-        # Skip first-run confirmation in simulation mode since we're not actually sending
-        first_run_flag_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.spamcop_first_run_complete')
-        is_first_run = not os.path.exists(first_run_flag_file) and not SIMULATION_MODE
-        
-        if is_first_run:
-            print("\n" + "="*70)
-            print("FIRST RUN - VERIFICATION REQUIRED")
-            print("="*70)
-            print(msg.FIRST_RUN_HEADER)  # type: ignore
-            print("\n" + "-"*70)
-            print("CRITICAL WARNING:")
-            print("-"*70)
-            print(msg.FIRST_RUN_WARNING)  # type: ignore
-            print("\n" + "-"*70)
-            print("DOWNLOADED EMAILS LIST:")
-            print("-"*70)
-            print(f"Total emails downloaded: {len(downloaded_files)}")
-            print(f"Download location: {download_path}")
-            print("\nEmail subjects (please verify these match your Gmail Spam folder):")
-            print()
-            
-            for idx, item in enumerate(spam_candidates, 1):
-                display_subject = safe_print_subject(item['subject'], 60)
-                print(f"  {idx}. {display_subject}")
-                if item['date']:
-                    print(f"     Date: {item['date']}")
-            
-            print("\n" + "="*70)
-            print("VERIFICATION STEPS:")
-            print("="*70)
-            print(msg.FIRST_RUN_VERIFICATION_STEPS)  # type: ignore
-            print("="*70)
-            print()
-            
-            while True:
-                response = input("Have you verified that ALL downloaded emails are spam? (yes/no): ").strip().lower()
-                if response in ['yes', 'y']:
-                    print("\n✓ Confirmation received. Proceeding with forwarding to SpamCop...")
-                    # Create flag file to mark first run as complete
-                    try:
-                        with open(first_run_flag_file, 'w') as f:
-                            f.write(f"First run completed: {datetime.datetime.now().isoformat()}\n")
-                    except Exception as e:
-                        print(f"Warning: Could not create first-run flag file: {e}")
-                    break
-                elif response in ['no', 'n']:
-                    print("\n" + "="*70)
-                    print("FORWARDING CANCELLED")
-                    print("="*70)
-                    print(msg.FIRST_RUN_CANCELLED.format(download_path=download_path))  # type: ignore
-                    print("="*70)
-                    print("\n--- ITERATION COMPLETE (NO EMAILS FORWARDED) ---")
-                    return
-                else:
-                    print("Please enter 'yes' or 'no'.")
-        
-        # Normal operation (after first run)
-        if not is_first_run:
-            if SIMULATION_MODE:
-                print("\n" + "-"*40)
-                print(f"SIMULATION MODE: Would bundle {len(downloaded_files)} files and send to SpamCop...")
-            else:
-                print("\n" + "-"*40)
-                print(f"Bundling {len(downloaded_files)} files and sending to SpamCop...")
-        
-        # Check simulation mode
+def forward_to_spamcop(downloaded_files, spam_candidates, total_size_bytes):
+    """Handles forwarding emails to SpamCop with first-run confirmation"""
+    # Check if this is the first run
+    first_run_flag_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), FIRST_RUN_FLAG_FILE)
+    is_first_run = not os.path.exists(first_run_flag_file) and not SIMULATION_MODE
+    
+    if is_first_run:
+        if not _handle_first_run_confirmation(first_run_flag_file, downloaded_files, spam_candidates):
+            return
+    
+    # Normal operation (after first run)
+    if not is_first_run:
         if SIMULATION_MODE:
-            print("\n" + "="*70)
-            print("SIMULATION MODE ENABLED - Email will NOT be sent to SpamCop")
-            print("="*70)
-            print(f"Would send email:")
-            print(f"  From: {GMAIL_ACCOUNT}")
-            print(f"  To: {SPAMCOP_ADDRESS}")
-            print(f"  Subject: Spam Report: {len(downloaded_files)} messages")
-            print(f"  Attachments: {len(downloaded_files)} EML files")
-            print()
-            for filepath in downloaded_files:
-                filename = os.path.basename(filepath)
-                file_size = os.path.getsize(filepath)
-                print(f"    - {filename} ({get_size_str(file_size)})")
-            print()
-            print("All steps completed successfully (connect, search, download, save).")
-            print("Set SIMULATION_MODE = False in config.py to enable actual forwarding.")
-            print("="*70)
+            print("\n" + "-"*40)
+            print(f"SIMULATION MODE: Would bundle {len(downloaded_files)} files and send to SpamCop...")
         else:
-            # Actual forwarding mode
-            print(f"\nConnecting to Gmail SMTP ({SMTP_SERVER})...")
-            try:
-                # Construct the Email
-                msg = MIMEMultipart()
-                msg['From'] = GMAIL_ACCOUNT
-                msg['To'] = SPAMCOP_ADDRESS
-                msg['Subject'] = f"Spam Report: {len(downloaded_files)} messages"
-                
-                # Attach files
-                print("Attaching files...")
-                for filepath in downloaded_files:
-                    filename = os.path.basename(filepath)
-                    with open(filepath, 'rb') as f:
-                        part = MIMEBase('message', 'rfc822')
-                        part.set_payload(f.read())
-                        encoders.encode_base64(part)
-                        part.add_header('Content-Disposition', f'attachment; filename="{filename}"')
-                        msg.attach(part)
-                
-                # Send using Gmail SMTP
-                print("Sending data...")
-                server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-                server.starttls()
-                server.login(GMAIL_ACCOUNT, APP_PASS)
-                server.send_message(msg)
-                server.quit()
-                
-                print("\nSUCCESS: Report sent to SpamCop.")
-                
-            except Exception as e:
-                print(f"\nFAILED to send email: {e}")
-                print("The files are still safe in your local folder.")
-                import traceback
-                traceback.print_exc()
+            print("\n" + "-"*40)
+            print(f"Bundling {len(downloaded_files)} files and sending to SpamCop...")
+    
+    # Check simulation mode
+    if SIMULATION_MODE:
+        _print_simulation_mode_info(downloaded_files)
     else:
-        print("\nSkipping send. Files remain in your local folder.")
+        _send_to_spamcop(downloaded_files)
 
-    print("\n--- ITERATION COMPLETE ---")
+def _handle_first_run_confirmation(first_run_flag_file, downloaded_files, spam_candidates):
+    """Handles first-run user confirmation and returns True if confirmed"""
+    download_path = os.path.dirname(downloaded_files[0]) if downloaded_files else ""
+    
+    print("\n" + "="*70)
+    print("FIRST RUN - VERIFICATION REQUIRED")
+    print("="*70)
+    print(msg.FIRST_RUN_HEADER)  # type: ignore
+    print("\n" + "-"*70)
+    print("CRITICAL WARNING:")
+    print("-"*70)
+    print(msg.FIRST_RUN_WARNING)  # type: ignore
+    print("\n" + "-"*70)
+    print("DOWNLOADED EMAILS LIST:")
+    print("-"*70)
+    print(f"Total emails downloaded: {len(downloaded_files)}")
+    print(f"Download location: {download_path}")
+    print("\nEmail subjects (please verify these match your Gmail Spam folder):")
+    print()
+    
+    for idx, item in enumerate(spam_candidates, 1):
+        display_subject = safe_print_subject(item['subject'], 60)
+        print(f"  {idx}. {display_subject}")
+        if item['date']:
+            print(f"     Date: {item['date']}")
+    
+    print("\n" + "="*70)
+    print("VERIFICATION STEPS:")
+    print("="*70)
+    print(msg.FIRST_RUN_VERIFICATION_STEPS)  # type: ignore
+    print("="*70)
+    print()
+    
+    while True:
+        response = input("Have you verified that ALL downloaded emails are spam? (yes/no): ").strip().lower()
+        if response in ['yes', 'y']:
+            print("\n✓ Confirmation received. Proceeding with forwarding to SpamCop...")
+            try:
+                with open(first_run_flag_file, 'w') as f:
+                    f.write(f"First run completed: {datetime.datetime.now().isoformat()}\n")
+            except Exception as e:
+                print(f"Warning: Could not create first-run flag file: {e}")
+            return True
+        elif response in ['no', 'n']:
+            print("\n" + "="*70)
+            print("FORWARDING CANCELLED")
+            print("="*70)
+            print(msg.FIRST_RUN_CANCELLED.format(download_path=download_path))  # type: ignore
+            print("="*70)
+            print("\n--- ITERATION COMPLETE (NO EMAILS FORWARDED) ---")
+            return False
+        else:
+            print("Please enter 'yes' or 'no'.")
+
+def _print_simulation_mode_info(downloaded_files):
+    """Prints simulation mode information"""
+    print("\n" + "="*70)
+    print("SIMULATION MODE ENABLED - Email will NOT be sent to SpamCop")
+    print("="*70)
+    print(f"Would send email:")
+    print(f"  From: {GMAIL_ACCOUNT}")
+    print(f"  To: {SPAMCOP_ADDRESS}")
+    print(f"  Subject: Spam Report: {len(downloaded_files)} messages")
+    print(f"  Attachments: {len(downloaded_files)} EML files")
+    print()
+    for filepath in downloaded_files:
+        filename = os.path.basename(filepath)
+        file_size = os.path.getsize(filepath)
+        print(f"    - {filename} ({get_size_str(file_size)})")
+    print()
+    print("All steps completed successfully (connect, search, download, save).")
+    print("Set SIMULATION_MODE = False in config.py to enable actual forwarding.")
+    print("="*70)
+
+def _send_to_spamcop(downloaded_files):
+    """Sends emails to SpamCop via SMTP"""
+    print(f"\nConnecting to Gmail SMTP ({SMTP_SERVER})...")
+    try:
+        # Construct the Email
+        msg = MIMEMultipart()
+        msg['From'] = GMAIL_ACCOUNT
+        msg['To'] = SPAMCOP_ADDRESS
+        msg['Subject'] = f"Spam Report: {len(downloaded_files)} messages"
+        
+        # Attach files
+        print("Attaching files...")
+        for filepath in downloaded_files:
+            filename = os.path.basename(filepath)
+            with open(filepath, 'rb') as f:
+                part = MIMEBase('message', 'rfc822')
+                part.set_payload(f.read())
+                encoders.encode_base64(part)
+                part.add_header('Content-Disposition', f'attachment; filename="{filename}"')
+                msg.attach(part)
+        
+        # Send using Gmail SMTP
+        print("Sending data...")
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(GMAIL_ACCOUNT, APP_PASS)
+        server.send_message(msg)
+        server.quit()
+        
+        print("\nSUCCESS: Report sent to SpamCop.")
+        
+    except Exception as e:
+        print(f"\nFAILED to send email: {e}")
+        print("The files are still safe in your local folder.")
+        import traceback
+        traceback.print_exc()
 
 def run_spam_processor():
     """Main loop that runs spam processing continuously"""
+    # Check if this is the first run and delete initial flag file if it exists
+    initial_flag_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), INITIAL_SETUP_FLAG_FILE)
+    is_first_run = not os.path.exists(initial_flag_path)
+    
+    # Delete the initial flag file if it exists (we'll recreate it after successful first run)
+    if os.path.exists(initial_flag_path):
+        try:
+            os.remove(initial_flag_path)
+            print(f"Deleted initial flag file: {initial_flag_path}")
+        except Exception as e:
+            print(f"Warning: Could not delete initial flag file: {e}")
+    
     # Validate configuration
     try:
         validate_loop_frequency(LOOP_FREQUENCY_HOURS)
@@ -1026,6 +1243,11 @@ def run_spam_processor():
     else:
         print("SIMULATION MODE: DISABLED - Emails WILL be forwarded to SpamCop")
     print("="*60)
+    
+    if is_first_run:
+        print("FIRST RUN DETECTED - Will abort if spam folders are not found")
+        print("="*60)
+    
     print("Starting first iteration immediately...\n")
     
     iteration_count = 0
@@ -1049,14 +1271,54 @@ def run_spam_processor():
         
         try:
             process_spam_iteration()
+            
+            # After successful first run, create the initial flag file
+            if is_first_run:
+                try:
+                    with open(initial_flag_path, 'w') as f:
+                        f.write(f"Initial setup completed: {datetime.datetime.now().isoformat()}\n")
+                    print(f"\n✓ Initial setup completed successfully. Flag file created: {initial_flag_path}")
+                    is_first_run = False  # No longer first run
+                except Exception as e:
+                    print(f"Warning: Could not create initial flag file: {e}")
+                    
         except KeyboardInterrupt:
             print("\n\nReceived interrupt signal. Shutting down gracefully...")
             break
+        except imaplib.IMAP4.error as e:
+            # If it's the first run and we couldn't find spam folders, abort to commandline
+            if is_first_run and ("Failed to select spam mailbox" in str(e) or "SPAM mailbox" in str(e) or "spam mailbox" in str(e).lower()):
+                print("\n" + "="*70)
+                print("FIRST RUN FAILED: Could not find spam folders")
+                print("="*70)
+                print("The script is aborting to commandline as this is the first run.")
+                print("Please verify your Gmail account settings and spam folder configuration.")
+                print("="*70)
+                sys.exit(1)
+            else:
+                print(f"\nERROR in iteration #{iteration_count}: {e}")
+                print("Continuing to next iteration...")
+                import traceback
+                traceback.print_exc()
         except Exception as e:
-            print(f"\nERROR in iteration #{iteration_count}: {e}")
-            print("Continuing to next iteration...")
-            import traceback
-            traceback.print_exc()
+            # If it's the first run and we had an error finding spam folders, abort
+            error_str = str(e).lower()
+            if is_first_run and ("spam" in error_str and ("folder" in error_str or "mailbox" in error_str)):
+                print("\n" + "="*70)
+                print("FIRST RUN FAILED: Error during spam folder detection")
+                print("="*70)
+                print(f"Error: {e}")
+                print("The script is aborting to commandline as this is the first run.")
+                print("Please verify your Gmail account settings and spam folder configuration.")
+                print("="*70)
+                import traceback
+                traceback.print_exc()
+                sys.exit(1)
+            else:
+                print(f"\nERROR in iteration #{iteration_count}: {e}")
+                print("Continuing to next iteration...")
+                import traceback
+                traceback.print_exc()
         
         # Record completion time
         last_run_time = datetime.datetime.now()
