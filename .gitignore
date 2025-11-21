@@ -1,0 +1,30 @@
+# Configuration file with sensitive credentials
+config.py
+
+# First run confirmation flag
+.spamcop_first_run_complete
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Downloads folder (contains spam emails)
+downloads/
+
